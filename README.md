@@ -64,16 +64,7 @@ The game runs locally on the device. The working route uses the Mac game's
 existing ARM64 executable and Metal renderer, with AgePad libraries providing
 the desktop APIs it expects on iOS. AgePad is not built from AoE source code.
 
-```mermaid
-flowchart LR
-    A[Your supported Mac game and Steam install] --> B[Private local packaging]
-    S[AgePad source] --> B
-    B --> C[Signed iPhone or iPad app]
-    C --> D[Original ARM64 game and Metal renderer]
-    C --> E[UIKit launcher and touch compatibility]
-    F[Steam CDN assets or Files folder] --> G[Verified app data container]
-    G --> D
-```
+<img src="docs/images/technical-approach.png" width="640" alt="Your supported Mac game and Steam installation plus AgePad source are privately packaged into a signed iPhone or iPad app. The original ARM64 game runs with Metal and UIKit touch compatibility. Steam or Files assets are verified into a separate data container read by the game.">
 
 The packager rewrites Mach-O platform metadata, library dependencies and signing
 information. It verifies the original file-backed sections against the expected
