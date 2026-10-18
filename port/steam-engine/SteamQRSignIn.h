@@ -6,6 +6,17 @@
 
 typedef void (^AgePadSteamChallengeHandler)(NSString *challengeURL);
 
+// One sign-in attempt. Cancel when its panel is removed or another method
+// replaces it. Cancellation also stops an in-flight HTTPS request.
+@interface AgePadSteamSignInRequest : NSObject
+@property(nonatomic,readonly,getter=isCancelled) BOOL cancelled;
+@property(nonatomic,copy) void (^progress)(NSString *message);
+// Normal credential sign-in prefers mobile approval when Steam offers it.
+// Set before starting to explicitly use a Guard code instead, if offered.
+@property(nonatomic) BOOL prefersGuardCode;
+- (void)cancel;
+@end
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,6 +25,8 @@ extern "C" {
 // QR must be shown. Returns nil and sets error on failure or timeout.
 NSDictionary *AgePadSteamQRSignIn(NSString *deviceName,NSTimeInterval timeout,
     AgePadSteamChallengeHandler onChallenge,NSString **error);
+NSDictionary *AgePadSteamQRSignInWithRequest(NSString *deviceName,NSTimeInterval timeout,
+    AgePadSteamSignInRequest *request,AgePadSteamChallengeHandler onChallenge,NSString **error);
 // Keys in the result.
 extern NSString *const AgePadSteamRefreshToken,*const AgePadSteamAccountName,*const AgePadSteamID64;
 
@@ -24,9 +37,16 @@ NSData *AgePadSteamQRPNG(NSString *challengeURL,CGFloat pixels);
 // encrypted in memory with Steam's RSA key and sent; it is never stored or
 // logged. askCode (blocking, off the main thread) returns the code for codeType
 // 2 (email) or 3 (authenticator). waitingForApproval fires when Steam offers
-// approval in the phone app. Returns the same keys as the QR sign-in.
+// approval in the phone app; normal sign-in polls that path immediately rather
+// than also asking for a code. Returns the same keys as the QR sign-in.
 NSDictionary *AgePadSteamPasswordSignIn(NSString *accountName,NSString *password,NSString *deviceName,
     NSString *(^askCode)(int codeType),void (^waitingForApproval)(void),NSString **error);
+NSDictionary *AgePadSteamPasswordSignInWithRequest(NSString *accountName,NSString *password,NSString *deviceName,
+    AgePadSteamSignInRequest *request,NSString *(^askCode)(int codeType),void (^waitingForApproval)(void),NSString **error);
+
+// Only Valve's HTTPS QR challenge links are offered as same-device handoffs.
+BOOL AgePadSteamIsChallengeURL(NSString *url);
+BOOL AgePadSteamShouldCancelDetachedPanel(BOOL wasAttached,BOOL hasWindow,BOOL hasSuperview);
 
 #ifdef __cplusplus
 }

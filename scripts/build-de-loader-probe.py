@@ -7,6 +7,8 @@ import plistlib
 import re
 import subprocess
 
+from agepad_device_config import universal_info
+
 
 def run(*args):
     subprocess.run([str(x) for x in args], check=True)
@@ -29,7 +31,8 @@ app.mkdir(parents=True,exist_ok=True)
 sdk = subprocess.check_output(["xcrun","--sdk","iphonesimulator","--show-sdk-path"],text=True).strip()
 run("xcrun","clang","-target","arm64-apple-ios15.0-simulator","-isysroot",sdk,
     "-fobjc-arc",root/"port/de/LoaderProbe.m","-framework","UIKit","-framework","Foundation",
-    "-framework","Metal","-framework","CoreGraphics","-o",app/"DELoaderProbe")
+    "-framework","Metal","-framework","CoreGraphics","-framework","UniformTypeIdentifiers",
+    "-o",app/"DELoaderProbe")
 run("cp","-c",source/"Contents/MacOS/Age Of Empires II",app/"OriginalEngine")
 run("cp","-c",source/"Contents/Resources/feral.metallib",app/"feral.metallib")
 if args.shader:
@@ -56,12 +59,11 @@ if args.adapt_engine:
         '-x','c','/dev/null','-Wl,-reexport_framework,AudioToolbox',
         '-Wl,-install_name,@loader_path/AudioUnitCompat.dylib','-o',app/'AudioUnitCompat.dylib')
     run('codesign','--force','--sign','-',app/'AudioUnitCompat.dylib')
-info = {"CFBundleIdentifier":"local.agepad.de-loader-probe","CFBundleExecutable":"DELoaderProbe",
+info = universal_info({"CFBundleIdentifier":"local.agepad.de-loader-probe","CFBundleExecutable":"DELoaderProbe",
     "CFBundleName":"DE Loader Probe","CFBundlePackageType":"APPL","CFBundleVersion":"1",
-    "CFBundleShortVersionString":"0.1","MinimumOSVersion":"15.0","UIDeviceFamily":[2],
-    "CFBundleSupportedPlatforms":["iPhoneSimulator"],"UIRequiresFullScreen":True,
-    "UIApplicationSupportsIndirectInputEvents":True,"UILaunchScreen":{},
-    "UISupportedInterfaceOrientations":["UIInterfaceOrientationLandscapeLeft","UIInterfaceOrientationLandscapeRight"]}
+    "CFBundleShortVersionString":"0.1","MinimumOSVersion":"15.0",
+    "UIApplicationSupportsIndirectInputEvents":True,"UILaunchScreen":{}},
+    supported_platform='iPhoneSimulator')
 (app/"Info.plist").write_bytes(plistlib.dumps(info))
 run("codesign","--force","--sign","-",app)
 print(app)

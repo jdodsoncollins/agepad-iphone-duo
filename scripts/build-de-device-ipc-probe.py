@@ -9,6 +9,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+from agepad_ipc_entry import derive_helper_entry, validate_helper_entry
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -16,6 +17,7 @@ parser.add_argument('--source', type=Path, required=True, help='Private ipcserve
 parser.add_argument('--output', type=Path, required=True, help='Fresh ignored output directory')
 args = parser.parse_args()
 source = args.source.resolve(strict=True)
+entry_metadata = derive_helper_entry(source.read_bytes())
 output = args.output.resolve()
 if output.exists():
     parser.error('Output already exists; preserve earlier probe evidence')
@@ -24,6 +26,7 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'],
 shim = output / 'IPCSystemCompat.dylib'
 subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-target', 'arm64-apple-ios15.0',
                 '-isysroot', sdk, '-dynamiclib', str(ROOT / 'port/de/IPCSystemCompat.c'),
+                '-framework', 'CoreFoundation',
                 '-Wl,-reexport_library,' + sdk + '/usr/lib/libSystem.tbd',
                 '-Wl,-install_name,@rpath/IPCSystemCompat.dylib', '-o', str(shim)], check=True)
 spec = importlib.util.spec_from_file_location('de_adapter', ROOT / 'scripts/prepare-de-load-image.py')
@@ -36,6 +39,7 @@ result = adapter.prepare(source, helper, platform='ios-device', dependency_map={
     '/usr/lib/libSystem.B.dylib': '@loader_path/IPCSystemCompat.dylib'})
 if result['instructions_changed'] or not all(item['equal'] for item in result['sections']):
     raise SystemExit('Original helper sections changed')
+validate_helper_entry(entry_metadata, source.read_bytes(), helper.read_bytes())
 for image in (shim, helper):
     build = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(image)], text=True)
     if 'platform IOS\n' not in build:
@@ -43,5 +47,7 @@ for image in (shim, helper):
 (output / 'manifest.json').write_text(json.dumps({
     'scope': 'in-app helper diagnostic; no Steam session, auth or gameplay',
     'helper': result,
+    'entry_metadata': entry_metadata,
 }, indent=2) + '\n')
+(output / 'IPCHelperEntry.json').write_text(json.dumps(entry_metadata, indent=2) + '\n')
 print(helper)

@@ -1,23 +1,9 @@
 // Host the original WebKitLegacy WAKView; no replacement HTML or JS bridge.
 // Signatures checked against the running Simulator and WebKit WAKWindow.h.
 #include <dlfcn.h>
+#include "HostGeometry.h"
+#include "TrackingTypes.h"
 #import <objc/message.h>
-@protocol DETrackingConfig
-- (NSUInteger)options;
-- (CGRect)rect;
-- (id)owner;
-@end
-@protocol DEHoverEvent
-- (void)setType:(NSUInteger)value;
-- (void)setLocationInWindow:(CGPoint)value;
-- (void)setTimestamp:(NSTimeInterval)value;
-- (void)setTrackingArea:(id)value;
-@end
-@interface DEWebTrackingRecord : NSObject
-@property(nonatomic,strong) id<DETrackingConfig> area;
-@property(nonatomic) BOOL inside;
-@end
-@implementation DEWebTrackingRecord @end
 @protocol DEWebMouseEventAPI
 - (id)initWithMouseEventType:(int)type timeStamp:(CFTimeInterval)timeStamp location:(CGPoint)point modifiers:(unsigned)modifiers;
 @end
@@ -192,10 +178,13 @@ static void DELogWebLayers(CALayer *layer,int depth) {
 - (void)layoutSubviews {
     [super layoutSubviews];DEWebLock();
     [self.wakWindow setContentRect:self.bounds];
-    UIScreen *screen=self.window.screen ?: UIScreen.mainScreen;
-    [self.wakWindow setScreenSize:screen.bounds.size];
-    [self.wakWindow setAvailableScreenSize:screen.bounds.size];
-    [self.wakWindow setScreenScale:screen.scale];
+    UIWindow *window=self.window ?: DEHostWindow();
+    UIScreen *screen=window.windowScene.screen ?: window.screen;
+    CGSize viewport=window?window.bounds.size:self.bounds.size;
+    [self.wakWindow setScreenSize:viewport];
+    [self.wakWindow setAvailableScreenSize:viewport];
+    CGFloat scale=self.traitCollection.displayScale;
+    [self.wakWindow setScreenScale:scale>0?scale:screen.scale];
     [self.wakWindow setExposedScrollViewRect:self.bounds];
     [self.wakWindow layoutTiles];
 }

@@ -4,7 +4,9 @@
 // The loadable representation differs only in Mach-O packaging; its original
 // sections match.
 #import <Foundation/Foundation.h>
-#include <CommonCrypto/CommonDigest.h>
+#include "BundleImagePaths.h"
+#include "DataDigest.h"
+#include "SteamModuleDigest.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -68,37 +70,7 @@ static NSDictionary *DESteamModuleConfig(void) {
 static NSString *DESteamModuleDigest(NSString *path) {
     NSData *data=[NSData dataWithContentsOfFile:path];
     if (!data || data.length>UINT32_MAX) return nil;
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(data.bytes,(CC_LONG)data.length,digest);
-    NSMutableString *text=[NSMutableString stringWithCapacity:64];
-    for (unsigned i=0;i<sizeof(digest);i++) [text appendFormat:@"%02x",digest[i]];
-    return text;
-}
-// SHA-256 over every section's bytes of a thin arm64 Mach-O: the module's code
-// and data, unaffected by re-signing (a sideloading tool signs the app again).
-static NSString *DESteamModuleSectionsDigest(NSString *path) {
-    NSData *file=[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
-    const uint8_t *d=file.bytes;size_t n=file.length;
-    if (n<32 || *(const uint32_t *)d!=0xfeedfacf) return nil;
-    uint32_t count=*(const uint32_t *)(d+16);size_t offset=32;
-    CC_SHA256_CTX context;CC_SHA256_Init(&context);
-    for (uint32_t i=0;i<count && offset+8<=n;i++) {
-        uint32_t cmd=*(const uint32_t *)(d+offset),size=*(const uint32_t *)(d+offset+4);
-        if (cmd==0x19 && offset+72<=n) {
-            uint32_t sections=*(const uint32_t *)(d+offset+64);
-            for (uint32_t s=0;s<sections && offset+72+80*(s+1)<=n;s++) {
-                const uint8_t *section=d+offset+72+80*s;
-                uint64_t length=*(const uint64_t *)(section+40);uint32_t start=*(const uint32_t *)(section+48);
-                if (start && start+length<=n) CC_SHA256_Update(&context,d+start,(CC_LONG)length);
-            }
-        }
-        if (!size) return nil;
-        offset+=size;
-    }
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256_Final(digest,&context);
-    NSMutableString *text=[NSMutableString stringWithCapacity:64];
-    for (unsigned i=0;i<sizeof(digest);i++) [text appendFormat:@"%02x",digest[i]];
-    return text;
+    return AgePadSHA256(data);
 }
 static void *DESteamModuleDlopen(const char *path,int flags) {
     if (DESteamModuleLoading || !path || !strstr(path,"libsteam_api.dylib") ||
@@ -109,7 +81,7 @@ static void *DESteamModuleDlopen(const char *path,int flags) {
         NSString *bundle=NSBundle.mainBundle.bundlePath;
         NSString *expected=DEAdjacentSteamPath();
         NSString *requested=[NSString stringWithUTF8String:path];
-        NSString *translated=[bundle stringByAppendingPathComponent:@"Frameworks/SteamModuleSimulator.dylib"];
+        NSString *translated=DEBundleImagePath(@"Frameworks/SteamModuleSimulator.dylib");
         NSDictionary *config=DESteamModuleConfig();
         BOOL device=getenv("AGEPAD_DEVICE_STEAM_MODULE")!=NULL;
         NSString *original=device?DEDeviceOriginalSteamPath():expected;
@@ -129,7 +101,7 @@ static void *DESteamModuleDlopen(const char *path,int flags) {
                 fprintf(stderr,"DE_STEAM_DIAGNOSTIC_PAUSE pid=%d\n",getpid());fflush(stderr);
                 raise(SIGSTOP);
             }
-            result=dlopen(translated.fileSystemRepresentation,flags);
+            result=translated ? dlopen(translated.fileSystemRepresentation,flags) : NULL;
             int saved=errno;
             fprintf(stderr,"DE_STEAM_MODULE verified=1 device=%d loaded=%d\n",device,result!=NULL);
             fflush(stderr);errno=saved;

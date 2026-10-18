@@ -1,6 +1,6 @@
 # Third-party notices
 
-## What the iPad app contains
+## Upstream's redistributable base app
 
 The released app (`AgePad-vX.Y.Z-ios-unsigned.ipa`, which `scripts/agepad-ipad.sh kit`
 makes as `AgePad-base.ipa`) holds only AgePad's own code (the iPad compatibility libraries,
@@ -13,6 +13,12 @@ One piece of third-party code is compiled into it:
 | Component | Where | License |
 |---|---|---|
 | [bcdec](https://github.com/iOrange/bcdec) by Sergii Kudlai | `port/de/BC6Kernel.*`, `port/de/BC7Kernel.*`, `port/de/BCBasicKernel.inc` (texture decoding on the GPU) | MIT; the notice is kept in each file |
+
+The fork's native Steam asset downloader also compiles the standalone
+Zstandard decoder under its BSD license. It uses XZ's 0BSD API headers to link
+Apple's system liblzma; no XZ library or executable is bundled. Source pins and
+license files are in [port/third_party](port/third_party/README.md). Personal
+device packages include these notices in `ThirdPartyNotices.txt`.
 
 ## What you add yourself
 

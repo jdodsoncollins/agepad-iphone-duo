@@ -4,10 +4,11 @@
 // presentation stay consistent. Core Animation upscales the result.
 #pragma once
 #import <UIKit/UIKit.h>
+#include "HostGeometry.h"
 #include <stdio.h>
 #include <stdlib.h>
-static inline CGFloat DERenderScale(UIScreen *screen) {
-    CGFloat native=screen.scale ?: UIScreen.mainScreen.scale;
+static inline CGFloat DERenderScaleFromNative(CGFloat native) {
+    if (native<=0) native=1;
     const char *value=getenv("AGEPAD_DEVICE_RENDER_SCALE");
     if (!value) return native;
     double requested=atof(value);
@@ -15,4 +16,18 @@ static inline CGFloat DERenderScale(UIScreen *screen) {
     static int logged;
     if (!logged) { logged=1; fprintf(stderr,"DE_RENDER_SCALE native=%g requested=%s used=%g\n",native,value,scale); }
     return scale;
+}
+static inline CGFloat DERenderScaleForView(UIView *view) {
+    CGFloat native=view.traitCollection.displayScale;
+    if (native<=0) native=(view.window.windowScene.screen ?: view.window.screen).scale;
+    CGSize viewport=DEHostBoundsForScreen(view.window.windowScene.screen ?: view.window.screen).size;
+    return DEGameCanvasBackingScale(viewport,DERenderScaleFromNative(native));
+}
+static inline CGFloat DERenderScaleForWindow(UIWindow *window) {
+    return DERenderScaleForView(window.rootViewController.viewIfLoaded ?: window);
+}
+static inline CGFloat DERenderScale(UIScreen *screen) {
+    UIWindow *window=DEHostWindow();
+    UIScreen *hostScreen=window.windowScene.screen ?: window.screen;
+    return window && screen==hostScreen?DERenderScaleForWindow(window):DERenderScaleFromNative(screen.scale);
 }

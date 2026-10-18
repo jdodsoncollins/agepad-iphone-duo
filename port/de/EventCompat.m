@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include "UnsupportedBoundary.h"
 #import <UIKit/UIKit.h>
+#include "HostGeometry.h"
 extern CGPoint DEUIKitPointerPosition(void);
 @interface NSEvent : NSObject
 @property(nonatomic) NSUInteger type,modifierFlags;
@@ -27,9 +28,10 @@ extern CGPoint DEUIKitPointerPosition(void);
 @implementation NSEvent
 + (CGPoint)mouseLocation {
     CGPoint point=DEUIKitPointerPosition();
-    CGSize screen=UIScreen.mainScreen.bounds.size;
-    fprintf(stderr,"DE_NSEVENT_MOUSE_LOCATION UIKit=%g,%g screenHeight=%g\n",point.x,point.y,screen.height);
-    return CGPointMake(point.x,screen.height-point.y);
+    CGRect bounds=DEHostBoundsForScreen(DEHostScreen());
+    fprintf(stderr,"DE_NSEVENT_MOUSE_LOCATION UIKit=%g,%g viewportHeight=%g\n",point.x,point.y,bounds.size.height);
+    CGPoint game=DEGamePointFromHost(point,bounds.size);
+    return CGPointMake(game.x,DEGameCanvasSize(bounds.size).height-game.y);
 }
 + (NSTimeInterval)doubleClickInterval {
     // App-owned gesture policy; UIKit does not export the macOS preference.

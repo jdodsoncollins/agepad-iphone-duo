@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 #include <mach-o/dyld.h>
 #include <limits.h>
+#include "BundleImagePaths.h"
 #define DE_PATH_RELAY_CLIENT 1
 #include "SteamPathRelay.h"
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
@@ -190,6 +191,18 @@ int kill(pid_t pid,int signal) {
 void *dlopen(const char *path,int mode) {
     void *(*real)(const char *,int)=dlsym(RTLD_NEXT,"dlopen");
     if (!real) return NULL;
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    // The embedded client still asks for its original dylib basename. Resolve
+    // only this known module through the app's signed framework map.
+    const char *leaf = path ? strrchr(path, '/') : NULL;
+    leaf = leaf ? leaf + 1 : path;
+    if (leaf && !strcmp(leaf,"steamclient.dylib") && getenv("AGEPAD_DEVICE_LOCAL_IPC_PROBE")) {
+        char mapped[PATH_MAX];
+        if (DECopyBundleImagePath("Frameworks/steamclient.dylib",mapped,sizeof(mapped)))
+            return real(mapped,mode);
+        return NULL;
+    }
+#endif
     if (path && atomic_load(&DEHostSteamPID)>0 &&
         getenv("AGEPAD_HOST_PATH_RELAY_TCP_HOST")) {
         char hostExecutable[sizeof(DEHostSteamExecutable)]={0};
@@ -203,16 +216,10 @@ void *dlopen(const char *path,int mode) {
             memcmp(path,hostExecutable,prefix)==0 &&
             strcmp(path+prefix,clientName)==0) {
             char executable[PATH_MAX]={0};
-            uint32_t size=sizeof(executable);
-            if (_NSGetExecutablePath(executable,&size)==0) {
-                char *deviceSlash=strrchr(executable,'/');
-                if (deviceSlash && (size_t)(deviceSlash-executable)+
-                    sizeof("/Frameworks/steamclient.dylib")<sizeof(executable)) {
-                    strcpy(deviceSlash,"/Frameworks/steamclient.dylib");
-                    void *local=real(executable,mode);
-                    fprintf(stderr,"DE_IPC_LOCAL_STEAM_CLIENT mapped=%d\n",local!=NULL);fflush(stderr);
-                    if (local) return local;
-                }
+            if (DECopyBundleImagePath("Frameworks/steamclient.dylib",executable,sizeof(executable))) {
+                void *local=real(executable,mode);
+                fprintf(stderr,"DE_IPC_LOCAL_STEAM_CLIENT mapped=%d\n",local!=NULL);fflush(stderr);
+                if (local) return local;
             }
         }
     }

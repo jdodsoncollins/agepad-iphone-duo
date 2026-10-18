@@ -3,6 +3,7 @@
 #import <GameController/GameController.h>
 #include "UnsupportedBoundary.h"
 #include "HardwareKeyMapping.h"
+#include "HostGeometry.h"
 #include <dlfcn.h>
 extern CGPoint DEUIKitPointerPosition(void);
 // App-owned input domain: iOS has no macOS login-session event stream.
@@ -33,7 +34,7 @@ const void *CGEventCreate(const void *source) {
         DEUnsupported("CGEvent foreign source");
     if (source && [(__bridge DEAppEventSource *)source stateID] == -1)
         DEUnsupported("CGEvent private source snapshot not implemented");
-    CGPoint point=DEUIKitPointerPosition();
+    CGPoint point=DEGamePointFromHost(DEUIKitPointerPosition(),DEHostBoundsForScreen(DEHostScreen()).size);
     NSDictionary *snapshot=@{@"DEPointerSnapshot":@YES,@"x":@(point.x),@"y":@(point.y)};
     if (!getenv("AGEPAD_QUIET_RENDER_TRACE")) fprintf(stderr,"DE_POINTER_SNAPSHOT x=%g y=%g\n",point.x,point.y);
     return CFBridgingRetain(snapshot);
@@ -61,6 +62,6 @@ bool CGEventSourceKeyState(int32_t source,uint16_t key) {
 extern void DEUIKitSetPointerPosition(CGPoint point);
 int32_t CGWarpMouseCursorPosition(CGPoint point) {
     if (!isfinite(point.x) || !isfinite(point.y)) return 1001; // illegal argument
-    DEUIKitSetPointerPosition(point);
+    DEUIKitSetPointerPosition(DEHostPointFromGame(point,DEHostBoundsForScreen(DEHostScreen()).size));
     return 0;
 }

@@ -5,6 +5,7 @@
 /private/
 /build/
 /docs/artifacts/
+/assets/AoE2DEHeader.jpg
 __pycache__/
 *.pyc
 # PadMint's private workspace

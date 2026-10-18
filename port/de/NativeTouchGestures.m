@@ -2,6 +2,7 @@
 // One multi-finger gesture is either a zoom or a map drag, decided once:
 // three or more fingers always drag; with two, whichever the fingers do
 // first (spread 7% or move 16 points) wins until they lift.
+#include <string.h>
 typedef NS_ENUM(NSInteger, DEMapGestureMode) { DEMapGestureUndecided, DEMapGestureZoom, DEMapGestureScroll };
 static DEMapGestureMode DEMapMode;
 static BOOL DEGestureActive(UIGestureRecognizer *gesture) {
@@ -87,6 +88,8 @@ static BOOL DEGestureActive(UIGestureRecognizer *gesture) {
     return a!=b && [together containsObject:a] && [together containsObject:b];
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
+    if(self.commandWheel || self.wheelConsumed || self.HUDInputConsumed || self.gameTouchIsHUD ||
+       [self pointInHUDInputRegion:[touch locationInView:self.window]])return NO;
     for(UIView *view=touch.view;view && view!=self;view=view.superview)
         if([view isKindOfClass:UIControl.class])return NO;
     return YES;
@@ -154,11 +157,11 @@ static const CGFloat DEScrollMaxSpeed=1800,DEScrollCatchUp=0.08,DEScrollGain=1.2
 static CGFloat DEScrollRadiusForSpeed(CGFloat v) { // inverse of v(e)
     return DEScrollDeadZone+(sqrt(DEScrollLinear*DEScrollLinear+4*DEScrollSquare*v)-DEScrollLinear)/(2*DEScrollSquare);
 }
-static struct { BOOL active,started,pressed; CGPoint fingerStart,finger,base,target,moved,velocity,anchor;
+static struct { BOOL active,started,pressed; __unsafe_unretained DEGameViewHost *owner; CGPoint fingerStart,finger,base,target,moved,velocity,anchor;
     NSTimeInterval pressedAt,tick; __unsafe_unretained NSTimer *timer; } DEScroll;
 - (void)nativeMapScrollPhase:(NSInteger)phase point:(CGPoint)point {
     if(phase==0) {
-        DEMenuOpen=NO;DEScroll.active=YES;DEScroll.started=NO;DEScroll.fingerStart=DEScroll.finger=point;
+        DEMenuOpen=NO;DEScroll.owner=self;DEScroll.active=YES;DEScroll.started=NO;DEScroll.fingerStart=DEScroll.finger=point;
         DEScroll.base=DEScroll.target;
         fprintf(stderr,"DE_GESTURE_SCROLL state=began x=%g y=%g continuing=%d\n",point.x,point.y,DEScroll.pressed);
         return;
@@ -213,6 +216,21 @@ static struct { BOOL active,started,pressed; CGPoint fingerStart,finger,base,tar
         pointer=CGPointMake(DEScroll.anchor.x-need.x/distance*r,DEScroll.anchor.y-need.y/distance*r/DEScrollYStretch);
     }
     [self nativeMouse:7 point:pointer wheel:0];
+}
+- (void)cancelNativeGestures {
+    if(DEScroll.owner==self) {
+        [DEScroll.timer invalidate];DEScroll.timer=nil;
+        if(DEScroll.pressed) {
+            // A short right press released on the map becomes an order. Use
+            // the same offscreen cancellation policy as sendGameMouse.
+            CGPoint cancelled=CGPointMake(-10000,-10000);
+            [self nativeMouse:7 point:cancelled wheel:0];
+            [self nativeMouse:4 point:cancelled wheel:0];
+        }
+        memset(&DEScroll,0,sizeof(DEScroll));DEMapMode=DEMapGestureUndecided;
+    }
+    self.mapPan.enabled=NO;self.mapPan.enabled=YES;
+    self.zoomPinch.enabled=NO;self.zoomPinch.enabled=YES;
 }
 // Zoom in whole wheel clicks, the same step as ZOOM +/−; fractional wheel
 // amounts zoomed far less than the fingers moved.

@@ -17,13 +17,38 @@ def align8(n):
     return (n + 7) & ~7
 
 
-def prepare(source, destination, audio_umbrella=False, platform='ios-simulator', dependency_map=None, preserve_executable=False):
+def packed_version(version):
+    """Mach-O's 16.8.8 version encoding; never silently truncate components."""
+    if not re.fullmatch(r'\d+(?:\.\d+){0,2}', version):
+        raise ValueError('Invalid SDK version: ' + version)
+    parts = [int(value) for value in version.split('.')]
+    parts += [0] * (3 - len(parts))
+    if parts[0] > 65535 or parts[1] > 255 or parts[2] > 255:
+        raise ValueError('SDK version is outside Mach-O version limits: ' + version)
+    return (parts[0] << 16) | (parts[1] << 8) | parts[2]
+
+
+def selected_sdk_version(platform):
+    sdk = 'iphoneos' if platform == 'ios-device' else 'iphonesimulator'
+    return subprocess.check_output(['xcrun', '--sdk', sdk, '--show-sdk-version'], text=True).strip()
+
+
+def prepare(source, destination, audio_umbrella=False, platform='ios-simulator', dependency_map=None,
+            preserve_executable=False, sdk_version=None):
     raw = source.read_bytes()
     image = bytearray(raw)
     magic,cpu,subcpu,filetype,ncmds,sizeofcmds,flags,reserved = struct.unpack_from('<8I', image)
     if magic != 0xfeedfacf or cpu != 0x100000c or filetype not in (2,6):
         raise ValueError('Expected thin arm64 executable or dylib')
     commands, changes, sections = [], [], []
+    if platform in ('ios-simulator', 'ios-device') and sdk_version is None:
+        sdk_version = selected_sdk_version(platform)
+    # dyld's SDK 27.1 validation rejects nonzero file offsets on virtual-only
+    # sections in some native Mac Steam images. Canonicalize this metadata,
+    # retaining their VM address/size and all file-backed program bytes. Older
+    # pinned kit recipes retain their original load-command representation.
+    normalize_zerofill = (platform in ('ios-simulator', 'ios-device') and
+                          packed_version(sdk_version) >= packed_version('27.1'))
     offset = 32
     first_section = len(image)
     for _ in range(ncmds):
@@ -35,6 +60,12 @@ def prepare(source, destination, audio_umbrella=False, platform='ios-simulator',
             nsects = struct.unpack_from('<I',data,64)[0]
             for i in range(nsects):
                 section_offset = struct.unpack_from('<I',data,72+80*i+48)[0]
+                section_type = struct.unpack_from('<I',data,72+80*i+64)[0] & 0xff
+                if section_type in (1, 0xc, 0x12):  # zero-fill, GB zero-fill, TLS zero-fill
+                    if normalize_zerofill and section_offset:
+                        struct.pack_into('<I',data,72+80*i+48,0)
+                        changes.append({'zerofill_file_offset':section_offset,'normalized_to':0})
+                    continue  # No file payload, even if the source records an offset.
                 if section_offset:
                     first_section = min(first_section,section_offset)
                     section_size=struct.unpack_from('<Q',data,72+80*i+40)[0]
@@ -47,9 +78,15 @@ def prepare(source, destination, audio_umbrella=False, platform='ios-simulator',
             continue
         if cmd == 0x32 and platform in ('ios-simulator', 'ios-device'):
             target_platform = 7 if platform == 'ios-simulator' else 2
-            struct.pack_into('<III',data,8,target_platform,15<<16,(26<<16)|(5<<8))
+            # UIKit's linked-SDK compatibility behavior is based on the main
+            # executable as well as the shims. Keep this aligned with the SDK
+            # actually selected by Xcode; the minimum OS stays independent.
+            # A recorded kit recipe supplies its pinned SDK for Xcode-free replay.
+            if sdk_version is None:
+                sdk_version = selected_sdk_version(platform)
+            struct.pack_into('<III',data,8,target_platform,15<<16,packed_version(sdk_version))
             changes.append({'platform':'iOS-simulator' if target_platform == 7 else 'iOS-device',
-                            'minos':'15.0'})
+                            'minos':'15.0', 'sdk': sdk_version})
         if cmd in (0xc,0x80000018,0x8000001f,0x80000023,0xd):
             nameoff = struct.unpack_from('<I',data,8)[0]
             old = data[nameoff:].split(b'\0')[0].decode()

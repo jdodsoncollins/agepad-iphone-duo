@@ -97,6 +97,9 @@ def sections_digest(data):
     for cmd, body in commands(data):
         if cmd == 0x19:
             for i in range(struct.unpack_from('<I', body, 64)[0]):
+                section_type = struct.unpack_from('<I', body, 72 + 80 * i + 64)[0] & 0xff
+                if section_type in (1, 0xc, 0x12):
+                    continue  # Virtual-only storage has no original file bytes.
                 size, offset = struct.unpack_from('<QI', body, 72 + 80 * i + 40)
                 if offset:
                     h.update(data[offset:offset + size])
@@ -125,6 +128,15 @@ def dylib_names(data):
     return names
 
 
+def linked_sdk(data):
+    """SDK recorded in the built image, so injection needs no local Xcode."""
+    for cmd, body in commands(data):
+        if cmd == 0x32:
+            version = struct.unpack_from('<I', body, 16)[0]
+            return '%d.%d.%d' % (version >> 16, (version >> 8) & 255, version & 255)
+    raise ValueError('Adapted image has no LC_BUILD_VERSION SDK')
+
+
 def load_adapter():
     import importlib.util
     here = Path(__file__).resolve().parent
@@ -146,7 +158,9 @@ def transform(source_thin, edits):
             data = source_thin
             for step in edits:
                 adapter.prepare(src, dst, platform=step['platform'], dependency_map=step['map'],
-                                preserve_executable=step['preserve'], audio_umbrella=step.get('audio', False))
+                                preserve_executable=step['preserve'], audio_umbrella=step.get('audio', False),
+                                # Pre-Duo recipes used the adapter's fixed 26.5.
+                                sdk_version=step.get('sdk', '26.5'))
                 data = dst.read_bytes()
                 src.write_bytes(data)
             return data
@@ -214,7 +228,8 @@ def recipe(app, out, game, steam):
         before, after = dylib_names(source_thin), dylib_names(arm)
         mapping = {a: b for a, b in zip(before, after) if a != b}
         filetype = struct.unpack_from('<I', arm, 12)[0]
-        edits = [{'platform': 'ios-device', 'map': mapping, 'preserve': filetype == 2}]
+        edits = [{'platform': 'ios-device', 'map': mapping, 'preserve': filetype == 2,
+                  'sdk': linked_sdk(arm)}]
         rebuilt = transform(source_thin, edits)
         same = header_key(rebuilt) == header_key(arm) and sections_digest(rebuilt) == sections_digest(arm)
         entries.append({'path': rel, 'source': key, 'source_sha256': sha(table[key].read_bytes()),

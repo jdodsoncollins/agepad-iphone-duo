@@ -1,5 +1,10 @@
 #include "DeviceLaunchConfig.h"
 #import <UIKit/UIKit.h>
+#include "BundleImagePaths.h"
+#include "HostGeometry.h"
+#include "IPCHelperEntryPoint.h"
+#import "GameAssetStore.m"
+#import "GameAssetImport.m"
 #include <spawn.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -16,13 +21,44 @@
 #include <os/proc.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <malloc/malloc.h>
 #include <execinfo.h>
 #include <stdatomic.h>
+#ifndef AGEPAD_PUBLIC_API
+#define AGEPAD_PUBLIC_API 0
+#endif
 #if __has_include("AgePadSteamRoute.h")
 #import "AgePadSteamRoute.h"
+#import "SteamAssetDownload.h"
+#import "GameLibraryView.m"
 #define AGEPAD_ENGINE_ROUTE 1
 #endif
+
+static BOOL DEIPCMetadataInteger(id value, uint64_t *result) {
+    if (![value isKindOfClass:NSNumber.class] ||
+        CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID() ||
+        CFNumberIsFloatType((__bridge CFNumberRef)value) || [value longLongValue] < 0) return NO;
+    *result = [value unsignedLongLongValue];
+    return YES;
+}
+
+static void *DEIPCHelperEntryFromBundle(const struct mach_header *header) {
+    NSURL *url = [NSBundle.mainBundle URLForResource:@"IPCHelperEntry" withExtension:@"json"];
+    NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
+    if (!data || data.length > 4096) return NULL;
+    id metadata = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![metadata isKindOfClass:NSDictionary.class]) return NULL;
+    id section = metadata[@"entry_section"];
+    if (![section isKindOfClass:NSDictionary.class] ||
+        ![section[@"segment"] isEqual:@"__TEXT"] || ![section[@"section"] isEqual:@"__text"]) return NULL;
+    uint64_t version, entry, offset, size;
+    if (!DEIPCMetadataInteger(metadata[@"schema_version"], &version) || version != 1 ||
+        !DEIPCMetadataInteger(metadata[@"header_relative_entry"], &entry) ||
+        !DEIPCMetadataInteger(section[@"file_offset"], &offset) ||
+        !DEIPCMetadataInteger(section[@"size"], &size)) return NULL;
+    return DEIPCEntryAddress(header, entry, offset, size);
+}
 
 // Opt-in, read-only main-thread watchdog for hardware runs. A main run-loop
 // timer advances a heartbeat; if it stops, a background thread briefly
@@ -242,6 +278,7 @@ static uintptr_t *DECensusSet;static uint32_t *DECensusIndex;static size_t DECen
 static Class *DECensusClasses;static unsigned DECensusClassCount;
 static uint64_t *DECensusHits,*DECensusBytes;static uint64_t DECensusSizeHits[64],DECensusSizeBytes[64],DECensusBlocks;
 static long DECensusStringClass=-1;static char DECensusSamples[8][49];static unsigned DECensusSampleCount;
+static BOOL DECensusCaptureStrings;
 static kern_return_t DECensusReader(task_t task,vm_address_t address,vm_size_t size,void **local) { *local=(void *)address;return KERN_SUCCESS; }
 static long DECensusLookup(uintptr_t isa) {
     if (!isa) return -1;
@@ -261,7 +298,7 @@ static void DECensusRecorder(task_t task,void *context,unsigned type,vm_range_t 
         }
         if (index<0) { unsigned bucket=size>=1024?63:(unsigned)(size>>4);DECensusSizeHits[bucket]++;DECensusSizeBytes[bucket]+=size;continue; }
         DECensusHits[index]++;DECensusBytes[index]+=size;
-        if (index==DECensusStringClass && DECensusSampleCount<8 && size>=40 && (DECensusHits[index]%100003)==1) {
+        if (DECensusCaptureStrings && index==DECensusStringClass && DECensusSampleCount<8 && size>=40 && (DECensusHits[index]%100003)==1) {
             // Swift native string storage: UTF-8 payload starts at offset 32.
             const unsigned char *payload=(const unsigned char *)ranges[r].address+32;
             size_t length=size-32<48?size-32:48;char *out=DECensusSamples[DECensusSampleCount++];
@@ -271,6 +308,8 @@ static void DECensusRecorder(task_t task,void *context,unsigned type,vm_range_t 
     }
 }
 static void DELogHeapCensus(unsigned seconds) {
+    BOOL startupMemory=getenv("AGEPAD_DEVICE_STARTUP_MEMORY")!=NULL;
+    DECensusCaptureStrings=!startupMemory;
     if (!DECensusClasses) {
         DECensusClasses=objc_copyClassList(&DECensusClassCount);
         size_t cap=1;while (cap<(size_t)DECensusClassCount*4) cap<<=1;
@@ -302,7 +341,8 @@ static void DELogHeapCensus(unsigned seconds) {
     for (unsigned s=0;s<DECensusSampleCount;s++) DEWatchdogLog("DE_HEAP_STRING_SAMPLE seconds=%u index=%u text=%s\n",seconds,s,DECensusSamples[s]);
     DEReportLeakSamples(seconds);
     for (int rank=0;rank<30;rank++) {
-        long best=-1;for (unsigned c=0;c<DECensusClassCount;c++) if (DECensusHits[c] && (best<0 || DECensusHits[c]>DECensusHits[best])) best=c;
+        long best=-1;for (unsigned c=0;c<DECensusClassCount;c++) if (DECensusHits[c] &&
+            (best<0 || (startupMemory?DECensusBytes[c]>DECensusBytes[best]:DECensusHits[c]>DECensusHits[best]))) best=c;
         if (best<0) break;
         DEWatchdogLog("DE_HEAP_CLASS seconds=%u rank=%d count=%llu kb=%llu class=%s\n",seconds,rank,(unsigned long long)DECensusHits[best],
             (unsigned long long)(DECensusBytes[best]>>10),class_getName(DECensusClasses[best]));
@@ -461,6 +501,9 @@ static void *DEMainWatchdogLoop(void *unused) {
         }
         DEInstallLeakSampler();
         DEInstallFrameCounter();
+        BOOL startupMemory=getenv("AGEPAD_DEVICE_STARTUP_MEMORY")!=NULL;
+        struct rusage previousUsage={0};getrusage(RUSAGE_SELF,&previousUsage);
+        uint64_t previousUsageTime=clock_gettime_nsec_np(CLOCK_MONOTONIC);
         for (unsigned early=1;early<=12;early++) {
             DEEnsureFaultLogger();
             usleep(100000);
@@ -494,6 +537,23 @@ static void *DEMainWatchdogLoop(void *unused) {
                 DEDumpNamedThread("WinMain");
             }
             if (tick%15==0) DELogMemoryByTag(tick*2);
+            // Opt-in snapshots early enough to precede a launch-time memory
+            // termination. Report allocation categories and class counts,
+            // not a larger entitlement or an assumed hardware requirement.
+            if(startupMemory) {
+                struct rusage usage={0};getrusage(RUSAGE_SELF,&usage);
+                uint64_t now=clock_gettime_nsec_np(CLOCK_MONOTONIC);
+                double before=previousUsage.ru_utime.tv_sec+previousUsage.ru_stime.tv_sec+
+                    (previousUsage.ru_utime.tv_usec+previousUsage.ru_stime.tv_usec)/1e6;
+                double after=usage.ru_utime.tv_sec+usage.ru_stime.tv_sec+
+                    (usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)/1e6;
+                DEWatchdogLog("DE_CPU_SAMPLE seconds=%u interval_pct=%.1f thermal=%ld\n",tick*2,
+                    now>previousUsageTime?100*(after-before)*1e9/(double)(now-previousUsageTime):0,
+                    (long)NSProcessInfo.processInfo.thermalState);
+                previousUsage=usage;previousUsageTime=now;
+                if(tick==1 || tick==5)DELogMemoryByTag(tick*2);
+                if(tick==5)DELogHeapCensus(tick*2);
+            }
             if ((tick==120 || tick==180) && getenv("AGEPAD_DEVICE_HEAP_CENSUS")) DELogHeapCensus(tick*2);
             // Opt-in: return free malloc pages to the system (Apple API; no
             // allocation is moved or freed). Tests whether idle heap growth
@@ -522,11 +582,41 @@ static void *DEMainWatchdogLoop(void *unused) {
 // new installation Feral's desktop pre-game launcher, which asks about sending
 // crash reports and usage statistics, is also skipped with "don't send"
 // (changeable later in the game's options).
+#if AGEPAD_PUBLIC_API
+static void DEApplyPublicLauncherPolicy(NSString *path) {
+    // The supported native startup replaces the desktop launcher. Honor every
+    // other existing preference, including telemetry consent and HUD scale.
+    NSError *error=nil;
+    NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
+    if (!text) DEUnsupported("public-API launcher policy cannot read game preferences");
+    NSRegularExpression *entry=[NSRegularExpression regularExpressionWithPattern:
+        @"<value\\s+name=\"GameOptionsDialogShouldShow\"\\s+type=\"integer\">[^<]*</value>"
+        options:0 error:nil];
+    NSArray<NSTextCheckingResult *> *matches=[entry matchesInString:text options:0 range:NSMakeRange(0,text.length)];
+    NSString *value=@"<value name=\"GameOptionsDialogShouldShow\" type=\"integer\">0</value>";
+    NSString *result=nil;
+    if (matches.count==1) result=[text stringByReplacingCharactersInRange:matches.firstObject.range withString:value];
+    else if (!matches.count) {
+        NSRange setup=[text rangeOfString:@"<key name=\"Setup\">"];
+        if (setup.location!=NSNotFound) result=[text stringByReplacingCharactersInRange:NSMakeRange(NSMaxRange(setup),0)
+            withString:[@"\n                        " stringByAppendingString:value]];
+    }
+    if (!result) DEUnsupported("public-API launcher policy encountered unsupported game preferences");
+    if (![result isEqualToString:text] && ![result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error])
+        DEUnsupported("public-API launcher policy cannot save game preferences");
+    fprintf(stderr,"DE_PUBLIC_API_LAUNCHER_POLICY desktop_dialog=disabled other_preferences=preserved\n");
+}
+#endif
 static void DEApplyDefaultUIScale(void) {
     NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
-    if ([defaults boolForKey:@"AgePadDefaultUIScaleApplied"] && !getenv("AGEPAD_TEST_FIRST_RUN")) return;
     NSString *path=[[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,NSUserDomainMask,YES).firstObject
         stringByAppendingPathComponent:@"Feral Interactive/Age Of Empires II"] stringByAppendingPathComponent:@"Preferences Data"];
+    if ([defaults boolForKey:@"AgePadDefaultUIScaleApplied"] && !getenv("AGEPAD_TEST_FIRST_RUN")) {
+#if AGEPAD_PUBLIC_API
+        DEApplyPublicLauncherPolicy(path);
+#endif
+        return;
+    }
     NSString *value=@"<value name=\"UI Scale\" type=\"integer\">125</value>";
     NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     NSString *result=nil;
@@ -567,6 +657,9 @@ static void DEApplyDefaultUIScale(void) {
     BOOL written=result && [result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [defaults setBool:YES forKey:@"AgePadDefaultUIScaleApplied"];
     fprintf(stderr,"DE_DEFAULT_UI_SCALE applied=%d new_file=%d\n",written,text==nil);
+#if AGEPAD_PUBLIC_API
+    DEApplyPublicLauncherPolicy(path);
+#endif
 }
 
 // Game files copied in by the player (Finder's iPad view or the Files app, or
@@ -638,6 +731,8 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
 
 @interface DEProbeViewController : UIViewController
 @property(nonatomic) CGSize lastLayoutSize;
+@property(nonatomic) CGFloat lastDisplayScale;
+@property(nonatomic,weak) UIScreen *lastScreen;
 @end
 @implementation DEProbeViewController
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -650,71 +745,124 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
     return UIEditingInteractionConfigurationNone;
 }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
+    return UIInterfaceOrientationMaskAll;
 }
 - (BOOL)shouldAutorotate { return YES; }
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-    return UIInterfaceOrientationLandscapeRight;
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    UIScreen *screen=self.view.window.windowScene.screen ?: self.view.window.screen;
+    if(screen) {
+        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitHostGeometryWillChange" object:self.view.window];
+        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitDisplayGeometryDidChange" object:screen];
+    }
 }
-- (void)viewDidAppear:(BOOL)animated {
-    [super viewDidAppear:animated];
-    UIWindowScene *scene=self.view.window.windowScene;
-    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
-    [self setNeedsUpdateOfSupportedInterfaceOrientations];
-    if (@available(iOS 16.0,*)) {
-        UIWindowSceneGeometryPreferencesIOS *preferences=
-            [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
-        [scene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError *error) {
-            fprintf(stderr,"DE_UIKIT_LANDSCAPE_REQUEST_FAILED %s\n",error.localizedDescription.UTF8String);
-        }];
-        fprintf(stderr,"DE_UIKIT_LANDSCAPE_REQUESTED scene=%p\n",scene);
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitHostGeometryWillChange" object:self.view.window];
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (previousTraitCollection && previousTraitCollection.displayScale!=self.traitCollection.displayScale) {
+        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitHostGeometryWillChange" object:self.view.window];
+        [self.view setNeedsLayout];
     }
-    // The translated engine is a legacy UIApplication host rather than a
-    // scene-delegate app. On the Simulator, the public geometry request can
-    // be accepted without rotating the legacy device orientation.
-    UIDeviceOrientation deviceOrientation=UIDevice.currentDevice.orientation;
-    if (deviceOrientation==UIDeviceOrientationPortrait ||
-        deviceOrientation==UIDeviceOrientationPortraitUpsideDown ||
-        deviceOrientation==UIDeviceOrientationFaceUp ||
-        deviceOrientation==UIDeviceOrientationFaceDown) {
-        [UIDevice.currentDevice setValue:@(UIDeviceOrientationLandscapeRight) forKey:@"orientation"];
-        fprintf(stderr,"DE_UIKIT_LEGACY_LANDSCAPE_HANDOFF orientation=landscape-right\n");
-    }
-    [UIViewController attemptRotationToDeviceOrientation];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self setNeedsUpdateOfSupportedInterfaceOrientations];
-        [UIViewController attemptRotationToDeviceOrientation];
-        UIWindowScene *nextScene=self.view.window.windowScene;
-        if (@available(iOS 16.0,*)) {
-            UIWindowSceneGeometryPreferencesIOS *nextPreferences=
-                [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
-            [nextScene requestGeometryUpdateWithPreferences:nextPreferences errorHandler:^(NSError *error) {
-                fprintf(stderr,"DE_UIKIT_LANDSCAPE_RETRY_FAILED %s\n",error.localizedDescription.UTF8String);
-            }];
-            fprintf(stderr,"DE_UIKIT_LANDSCAPE_RETRY_REQUESTED scene=%p\n",nextScene);
-        }
-    });
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGSize size=self.view.bounds.size;
-    if (!CGSizeEqualToSize(self.lastLayoutSize,CGSizeZero) && !CGSizeEqualToSize(self.lastLayoutSize,size) && self.view.window.screen)
-        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitDisplayGeometryDidChange" object:self.view.window.screen];
+    UIScreen *screen=self.view.window.windowScene.screen ?: self.view.window.screen;
+    CGFloat scale=self.traitCollection.displayScale;
+    BOOL changed=!CGSizeEqualToSize(self.lastLayoutSize,size) || self.lastDisplayScale!=scale || self.lastScreen!=screen;
+    BOOL hadLayout=!CGSizeEqualToSize(self.lastLayoutSize,CGSizeZero);
     self.lastLayoutSize=size;
+    self.lastDisplayScale=scale;
+    self.lastScreen=screen;
+    // Report the final window size, not a physical panel size or orientation.
+    if (hadLayout && changed && screen)
+        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitDisplayGeometryDidChange" object:screen];
 }
 @end
 
 @interface DEProbeDelegate : UIResponder <UIApplicationDelegate>
 @property(nonatomic,strong) UIWindow *window;
+@property(nonatomic) BOOL started;
+- (BOOL)startWithWindow:(UIWindow *)window;
+@end
+
+@interface DEProbeSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property(nonatomic,strong) UIWindow *window;
+@end
+@implementation DEProbeSceneDelegate
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+    if (![scene isKindOfClass:UIWindowScene.class]) return;
+    DEProbeDelegate *delegate=(DEProbeDelegate *)UIApplication.sharedApplication.delegate;
+    if (delegate.started) {
+        UIWindowScene *attached=delegate.window.windowScene;
+        if (attached && attached!=scene && attached.activationState!=UISceneActivationStateUnattached) {
+            fprintf(stderr,"DE_UIKIT_ADDITIONAL_GAME_SCENE_REFUSED\n");
+            return;
+        }
+        // UIKit may reconnect a discarded background scene without restarting
+        // the process. Preserve the running game's one host and its state.
+        self.window=delegate.window;
+        self.window.windowScene=(UIWindowScene *)scene;
+        [self.window makeKeyAndVisible];
+        [self.window.rootViewController.view setNeedsLayout];
+        return;
+    }
+    self.window=[[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+    [delegate startWithWindow:self.window];
+}
+- (void)sceneWillResignActive:(UIScene *)scene {
+    [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitHostGeometryWillChange" object:self.window];
+}
+- (void)windowScene:(UIWindowScene *)windowScene didUpdateCoordinateSpace:(id<UICoordinateSpace>)previousCoordinateSpace interfaceOrientation:(UIInterfaceOrientation)previousInterfaceOrientation traitCollection:(UITraitCollection *)previousTraitCollection {
+    // Screen/scale can change even when the new window has the same size.
+    [self.window.rootViewController.view setNeedsLayout];
+}
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    if (self.window.windowScene==scene) {
+        [NSNotificationCenter.defaultCenter postNotificationName:@"DEUIKitHostGeometryWillChange" object:self.window];
+        self.window.windowScene=nil;
+    }
+    self.window=nil;
+}
 @end
 
 @implementation DEProbeDelegate
-- (UIInterfaceOrientationMask)application:(UIApplication *)application
-    supportedInterfaceOrientationsForWindow:(UIWindow *)window {
-    return UIInterfaceOrientationMaskLandscape;
-}
+// Use the bundle's phone/iPad orientation masks. An application-wide All
+// override would bypass the phone's landscape policy.
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    application.idleTimerDisabled=NO;
+#if AGEPAD_ENGINE_ROUTE
+    // Reassociate daemon-owned transfers on a background relaunch without
+    // starting Valve's engine or the game merely to receive download events.
+    (void)AgePadSteamAssetDownload.shared;
+#endif
+    // Scene-based builds start once UIKit supplies the selected display.
+    if ([NSBundle.mainBundle objectForInfoDictionaryKey:@"UIApplicationSceneManifest"]) return YES;
+    // Keep older diagnostic manifests usable. Rebuilt apps use the scene path.
+    for (UIScene *scene in application.connectedScenes) {
+        if ([scene isKindOfClass:UIWindowScene.class] &&
+            (scene.activationState==UISceneActivationStateForegroundActive ||
+             scene.activationState==UISceneActivationStateForegroundInactive))
+            return [self startWithWindow:[[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene]];
+    }
+    UIScreen *screen=UIScreen.screens.firstObject;
+    fprintf(stderr,"DE_UIKIT_LEGACY_WINDOW_FALLBACK no scene manifest; rebuild for adaptive scenes\n");
+    return [self startWithWindow:[[UIWindow alloc] initWithFrame:screen.bounds]];
+}
+- (void)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))completionHandler {
+#if AGEPAD_ENGINE_ROUTE
+    [AgePadSteamAssetDownload.shared handleBackgroundSession:identifier completion:completionHandler];
+#else
+    completionHandler();
+#endif
+}
+- (BOOL)startWithWindow:(UIWindow *)window {
+    if (self.started) return YES;
+    self.started=YES;
+    self.window=window;
     UIViewController *vc = [DEProbeViewController new];
     self.window.rootViewController = vc;
     self.window.backgroundColor = UIColor.blackColor;
@@ -730,6 +878,9 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
     // Steam test and original game startup require explicit diagnostic flags.
     if ([NSFileManager.defaultManager fileExistsAtPath:
             [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"DeviceSetupGate"]]) {
+#if !AGEPAD_PUBLIC_API
+        // Development-only process/bootstrap probes are not part of the
+        // playable distribution path. Steam's helper runs in-process below.
         NSString *child = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"DeviceChildProbe"];
         pid_t childPID = 0;
         char *childArgv[] = {(char *)child.fileSystemRepresentation, NULL};
@@ -772,8 +923,8 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                 allocateStatus, rightStatus, sendStatus, receiveStatus,
                 receiveStatus == MACH_MSG_SUCCESS && received.header.msgh_id == echo.msgh_id);
         if (MACH_PORT_VALID(localPort)) mach_port_destroy(mach_task_self(), localPort);
-        NSString *helperImage = [NSBundle.mainBundle.bundlePath
-            stringByAppendingPathComponent:@"Frameworks/IPCHelperDevice.dylib"];
+#endif
+        NSString *helperImage = DEBundleImagePath(@"Frameworks/IPCHelperDevice.dylib");
         int (*ipcReady)(void) = NULL;
         void *shimLookUp = NULL;
         if ([NSFileManager.defaultManager fileExistsAtPath:helperImage]) {
@@ -784,9 +935,8 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
             fprintf(stderr, "DE_DEVICE_IPC_HELPER_LOAD loaded=%d error=%s\n",
                     loaded != NULL, loadError ?: "none");
             if (loaded) {
-                NSString *shimImage = [NSBundle.mainBundle.bundlePath
-                    stringByAppendingPathComponent:@"Frameworks/IPCSystemCompat.dylib"];
-                void *shim = dlopen(shimImage.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+                NSString *shimImage = DEBundleImagePath(@"Frameworks/IPCSystemCompat.dylib");
+                void *shim = shimImage ? dlopen(shimImage.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
                 void (*markThread)(void) = shim ? dlsym(shim, "DEIPCMarkHelperThread") : NULL;
                 int (*ready)(void) = shim ? dlsym(shim, "DELocalServiceReady") : NULL;
                 ipcReady = ready;
@@ -798,10 +948,12 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                         break;
                     }
                 }
-                if (header && markThread && ready) {
-                    // LC_MAIN entryoff from the owned helper, verified before
-                    // metadata adaptation. It runs on a separate app thread.
-                    int (*helperMain)(int, char **) = (void *)((uintptr_t)header + 6888);
+                int (*helperMain)(int, char **) = DEIPCHelperEntryFromBundle(header);
+                if (helperMain && markThread && ready) {
+                    // Exact original LC_MAIN metadata is signed with the app;
+                    // never call an offset remembered from another Steam build.
+                    fprintf(stderr, "DE_DEVICE_IPC_HELPER_ENTRY offset=0x%lx\n",
+                            (unsigned long)((uintptr_t)helperMain - (uintptr_t)header));
                     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                         markThread();
                         char *arguments[] = {(char *)"ipcserver", NULL};
@@ -812,8 +964,8 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                     for (int i = 0; i < 100 && !ready(); i++) usleep(10000);
                     fprintf(stderr, "DE_DEVICE_IPC_HELPER_READY ready=%d\n", ready());
                 } else {
-                    fprintf(stderr, "DE_DEVICE_IPC_HELPER_ENTRY_AVAILABLE header=%d mark=%d ready=%d\n",
-                            header != NULL, markThread != NULL, ready != NULL);
+                    fprintf(stderr, "DE_DEVICE_IPC_HELPER_ENTRY_AVAILABLE header=%d entry=%d mark=%d ready=%d\n",
+                            header != NULL, helperMain != NULL, markThread != NULL, ready != NULL);
                 }
             }
         }
@@ -821,10 +973,9 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
         // Experiment switch: leave the in-process Steam client untouched until
         // the game's own SteamAPI_Init, which then performs the real check.
         bool skipPreflight = getenv("AGEPAD_DEVICE_SKIP_STEAM_PREFLIGHT") && getenv("AGEPAD_DEVICE_RUN_ORIGINAL");
-        NSString *steamClient = [NSBundle.mainBundle.bundlePath
-            stringByAppendingPathComponent:@"Frameworks/steamclient.dylib"];
+        NSString *steamClient = DEBundleImagePath(@"Frameworks/steamclient.dylib");
         dlerror();
-        void *clientLoaded = dlopen(steamClient.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        void *clientLoaded = steamClient ? dlopen(steamClient.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
         const char *clientError = dlerror();
         fprintf(stderr, "DE_DEVICE_STEAM_CLIENT_LOAD loaded=%d error=%s\n",
                 clientLoaded != NULL, clientError ?: "none");
@@ -911,8 +1062,7 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
             steamInitialized = sessionLoggedOn;
             fprintf(stderr, "DE_DEVICE_STEAM_API_PREFLIGHT vendor_init=skipped logged_on=%d\n", sessionLoggedOn);
         }
-        NSString *steamAPI = gameOwnsSession ? nil : [NSBundle.mainBundle.bundlePath
-            stringByAppendingPathComponent:@"Vendor_libsteam_api.dylib.dylib"];
+        NSString *steamAPI = gameOwnsSession ? nil : DEBundleImagePath(@"Vendor_libsteam_api.dylib.dylib");
         dlerror();
         void *apiLoaded = steamAPI ? dlopen(steamAPI.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
         const char *apiError = dlerror();
@@ -935,7 +1085,15 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
         NSString *data = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
             stringByAppendingPathComponent:@"AgeOfEmpires2Data"];
         NSString *dataStatus = nil;
-        BOOL hasData = DEGameDataComplete(data, &dataStatus);
+        NSURL *assetProfile=[NSBundle.mainBundle URLForResource:@"GameDataProfile" withExtension:@"json"];
+        AgePadGameAssetStore *assetStore=assetProfile?[[AgePadGameAssetStore alloc] initWithHome:NSHomeDirectory() profileURL:assetProfile]:nil;
+        // The production inventory has 17,199 files. The import controller
+        // checks it on its worker queue and publishes readiness below.
+        __block BOOL hasData = assetStore?NO:DEGameDataComplete(data, &dataStatus);
+        __block BOOL steamRouteReady=steamInitialized;
+#if AGEPAD_ENGINE_ROUTE
+        __block AgePadGameLibraryView *library=nil;
+#endif
         // This opt-in is a launch diagnostic. A partial import may be enough
         // to reveal the next original-engine dependency, but is not gameplay.
         // Starts the original game once a Steam route is ready (now, or later
@@ -953,35 +1111,43 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
             setenv("AGEPAD_CASE_INSENSITIVE_RESOURCE_ROOT", caseRoot.fileSystemRepresentation, 1);
             fprintf(stderr, "DE_DEVICE_CASE_ROOT %s\n", caseRoot.fileSystemRepresentation);
             setenv("AGEPAD_DEVICE_DATA_ROOT", data.fileSystemRepresentation, 1);
-            NSString *appkitPath = [NSBundle.mainBundle.bundlePath
-                stringByAppendingPathComponent:@"DEBoundary_AppKit.dylib"];
-            void *appkit = dlopen(appkitPath.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+            NSString *appkitPath = DEBundleImagePath(@"DEBoundary_AppKit.dylib");
+            void *appkit = appkitPath ? dlopen(appkitPath.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
             void (*launch)(void) = appkit ? dlsym(appkit, "DEInvokeOriginalLaunchAfterUIKitReady") : NULL;
             fprintf(stderr, "DE_DEVICE_GAME_LAUNCH_READY steam=%d data_present=%d launch=%d\n",
                     1, hasData, launch != NULL);
             fflush(stderr);
             if (launch) {
+                UIApplication.sharedApplication.idleTimerDisabled=YES;
                 dispatch_async(dispatch_get_main_queue(), ^{ launch(); });
                 return YES;
             }
             return NO;
         };
-        if (getenv("AGEPAD_DEVICE_RUN_ORIGINAL") && steamInitialized && hasData && startGame()) return YES;
+        __block BOOL pairedGameStarted=NO;
+        BOOL (^startPairedGame)(void) = ^BOOL {
+            if(pairedGameStarted||engineRoute||!getenv("AGEPAD_DEVICE_RUN_ORIGINAL")||!steamInitialized||!hasData)return NO;
+            pairedGameStarted=startGame();
+            return pairedGameStarted;
+        };
+        if (startPairedGame()) return YES;
         UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:vc.view.bounds];
         scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         scroll.backgroundColor = [UIColor colorWithRed:.10 green:.14 blue:.17 alpha:1];
         [vc.view addSubview:scroll];
+        __weak UIScrollView *setupScroll=scroll;
         UIStackView *stack = [UIStackView new];
         stack.axis = UILayoutConstraintAxisVertical;
-        stack.spacing = 18;
+        BOOL phoneSetup=UIDevice.currentDevice.userInterfaceIdiom==UIUserInterfaceIdiomPhone;
+        stack.spacing = phoneSetup?12:18;
         stack.translatesAutoresizingMaskIntoConstraints = NO;
         [scroll addSubview:stack];
         [NSLayoutConstraint activateConstraints:@[
             [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor constant:40],
             [stack.trailingAnchor constraintLessThanOrEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-40],
             [stack.centerXAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.centerXAnchor],
-            [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:56],
-            [stack.bottomAnchor constraintLessThanOrEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-56],
+            [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:phoneSetup?20:56],
+            [stack.bottomAnchor constraintLessThanOrEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:phoneSetup?-20:-56],
             [stack.widthAnchor constraintLessThanOrEqualToConstant:850],
             [scroll.contentLayoutGuide.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
             [scroll.contentLayoutGuide.heightAnchor constraintGreaterThanOrEqualToAnchor:scroll.frameLayoutGuide.heightAnchor]
@@ -1001,13 +1167,16 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
         NSDictionary *disk = [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:NULL];
         unsigned long long freeBytes = [disk[NSFileSystemFreeSize] unsignedLongLongValue];
         NSString *freeSpace = [NSByteCountFormatter stringFromByteCount:(long long)freeBytes countStyle:NSByteCountFormatterCountStyleFile];
-        addLine(@"AGEPAD", 20, UIFontWeightBold, gold);
-        addLine(@"Age of Empires II: Definitive Edition", 34, UIFontWeightBold, UIColor.whiteColor);
+        addLine(@"AGEPAD", phoneSetup?16:20, UIFontWeightBold, gold);
+        addLine(@"Age of Empires II: Definitive Edition", phoneSetup?26:34, UIFontWeightBold, UIColor.whiteColor);
         BOOL paired = getenv("AGEPAD_STEAM_TUNNEL_HOST") != NULL;
 #if AGEPAD_ENGINE_ROUTE
         if (engineRoute) {
+            library=[[AgePadGameLibraryView alloc] initWithStore:assetStore];
+            library.installed=hasData;
+            library.installedChanged=^{hasData=YES;};
             UILabel *engineState = [UILabel new];
-            engineState.font = [UIFont systemFontOfSize:23 weight:UIFontWeightSemibold];
+            engineState.font = [UIFont systemFontOfSize:phoneSetup?18:23 weight:UIFontWeightSemibold];
             engineState.textColor = UIColor.whiteColor;
             engineState.numberOfLines = 0;
             UIStackView *actions = [UIStackView new];
@@ -1020,21 +1189,26 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                 return [UIButton buttonWithConfiguration:style primaryAction:[UIAction actionWithHandler:^(UIAction *a) { tap(); }]];
             };
             __block UIView *signInPanel = nil;
-            // The game's splash is a small window; show it on plain black, as
-            // on the Mac routes, instead of over this setup screen.
             BOOL (^play)(void) = ^BOOL {
-                if (!startGame()) return NO;
-                [scroll removeFromSuperview];
+                if(!hasData||!steamRouteReady||library.launching)return NO;
+                library.launching=YES;[library refresh];
+                if (!startGame()) {library.launching=NO;[library refresh];engineState.text=@"The game couldn't start. Your library and game files are kept.";return NO;}
+                // The game's host brings its real window above this library.
+                // Keep the library present until that happens; ownership alone
+                // must never discard the UI and reveal an empty black page.
                 return YES;
             };
+            library.play=^{play();};
             __block void (^showSignIn)(void) = nil;
             void (^startEngine)(void) = ^{
+                steamRouteReady=NO;
                 engineState.text = @"Starting Steam…";
                 [AgePadSteamRoute startWithClient:clientLoaded path:steamClient lookUp:(AgePadBootstrapLookUp)shimLookUp
                     status:^(NSString *message) { engineState.text = message; }
                     completion:^(NSString *error) {
-                        if (!error && !hasData) { engineState.text = @"Signed in to Steam. The game files still need copying to this iPad (see below)."; return; }
-                        if (!error && play()) return;
+                        if(!error){steamRouteReady=YES;library.owned=YES;library.installed=hasData;[library refresh];engineState.text=@"Steam library · 1 supported game";
+                            if(getenv("AGEPAD_DOWNLOAD_CHECK"))[library.download start];return;}
+                        library.owned=NO;[library refresh];
                         engineState.text = error ?: @"The game couldn't start.";
                         for (UIView *old in actions.arrangedSubviews) [old removeFromSuperview];
                         [actions addArrangedSubview:button(@"Sign in again", ^{ [AgePadSteamRoute forgetAccount]; showSignIn(); })];
@@ -1047,16 +1221,17 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                     startEngine();
                 }];
                 [stack insertArrangedSubview:signInPanel atIndex:[stack.arrangedSubviews indexOfObject:engineState] + 1];
-                engineState.text = @"Sign in to Steam once. After that, tapping AgePad opens your own copy of the game on this iPad, with no Mac needed.";
+                engineState.text = @"Sign in to Steam to verify access to your copy of Age of Empires II: Definitive Edition.";
             };
             [stack addArrangedSubview:engineState];
+            [stack addArrangedSubview:library];
             [stack addArrangedSubview:actions];
-            addLine(@"Online: everything works, including multiplayer.\nOffline (for example on a flight): single player, skirmish and campaigns, through Steam's offline mode. Before you go offline, open AgePad once with Internet so Steam is up to date.",
+            addLine(@"Sign in online before using Steam's offline mode for single player, skirmish and campaigns. Multiplayer has not been verified in this build.",
                     18, UIFontWeightRegular, muted);
             if (paired) [actions addArrangedSubview:button(@"Play with my Mac's Steam instead", ^{
                 engineState.text = @"Connecting to your Mac…";
                 DEPairedMacState = DEPairedMacSteamState();
-                if (DEPairedMacState == 1 && hasData && play()) return;
+                if (DEPairedMacState == 1 && hasData) {steamRouteReady=YES;library.owned=YES;[library refresh];engineState.text=@"Steam library · ready through your Mac";return;}
                 engineState.text = DEPairedMacState == 0 ? @"Steam isn't open on your Mac. Open it there and try again." :
                     @"Couldn't reach your Mac. Make sure it's awake and on the same Wi-Fi (or Tailscale).";
             })];
@@ -1069,15 +1244,24 @@ static NSString *DEDeviceLinkFeralDataFolder(NSString *imported) {
                 DEPairedMacState==0 ? @"Steam isn't open on your Mac. Open Steam there, then reopen AgePad." :
                 @"Couldn't reach your Mac. Make sure it's awake and on the same Wi-Fi (or Tailscale), then reopen AgePad.",
                 23, UIFontWeightSemibold, UIColor.whiteColor);
-        addLine(hasData ? @"Game files · Ready on this iPad" :
-                dataStatus ? [@"Game files · " stringByAppendingString:dataStatus] : @"Game files · Not on this iPad yet",
+        if(assetStore) {
+            [stack addArrangedSubview:AgePadGameAssetControls(vc,assetStore,^(BOOL ready,BOOL busy,NSString *message) {
+                hasData=ready&&!busy;
+#if AGEPAD_ENGINE_ROUTE
+                library.checkingInstallation=busy;library.installed=ready;[library refresh];
+                if(ready&&!busy)[AgePadSteamAssetDownload.shared configureStore:assetStore];
+#endif
+                if(!busy&&startPairedGame())[setupScroll removeFromSuperview];
+            })];
+        } else addLine(hasData ? @"Game files · Ready on this device" :
+                dataStatus ? [@"Game files · " stringByAppendingString:dataStatus] : @"Game files · Not on this device yet",
                 19, UIFontWeightMedium, UIColor.whiteColor);
-        addLine([NSString stringWithFormat:@"Free space on this iPad · %@",freeSpace],
+        addLine([NSString stringWithFormat:@"Free space on this device · %@",freeSpace],
                 19, UIFontWeightMedium, UIColor.whiteColor);
         if (!engineRoute) addLine(paired ? [NSString stringWithFormat:@"Steam · Uses your Mac (%s). Check that the Mac is awake, Steam is open and signed in, and the iPad is on the same Wi-Fi (or Tailscale). Then close and reopen AgePad.", getenv("AGEPAD_STEAM_TUNNEL_HOST")] :
                 @"Steam · AgePad uses the Steam app on your Mac to confirm you own the game. Your login stays on the Mac.",
                 19, UIFontWeightMedium, UIColor.whiteColor);
-        if (!engineRoute || !inventoryChecked) addLine(inventoryChecked ?
+        if (!assetStore && (!engineRoute || !inventoryChecked)) addLine(inventoryChecked ?
                 (paired ? @"The AgePad helper runs on the Mac (scripts/agepad-ipad.sh install-helper starts it automatically at login)." :
                  @"To pair: connect the iPad by USB and run  scripts/agepad-ipad.sh pair  on the Mac. After that, tap AgePad whenever the Mac is on with Steam open.") :
                 @"To copy the game files: connect the iPad to your Mac, open it in Finder, choose Files, and drag the AgeOfEmpires2Data folder onto AgePad. It's in Steam > Library > Age of Empires II: DE > Manage > Browse local files. (Or run  scripts/agepad-ipad.sh sync  in the AgePad folder.) About 20 GB; keep 25 GB free.",

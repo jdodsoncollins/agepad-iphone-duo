@@ -4,12 +4,24 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 typedef int32_t HSteamPipe,HSteamUser;
-static void *Engine,*User;
-static HSteamPipe Pipe;
-static HSteamUser GlobalUser;
-static struct { int logOn,logOff,loggedOn,logonState,connected,steamID,setLoginToken,logOnOffline,subscribed,canOffline; } Method;
+typedef struct {
+    int logOn,logOff,loggedOn,logonState,connected,steamID,setLoginToken,logOnOffline,subscribed,canOffline;
+} EngineMethods;
+typedef struct {
+    void *image,*engine,*user;
+    HSteamPipe pipe;
+    HSteamUser globalUser;
+    EngineMethods methods;
+} EngineContext;
+// Failed preparation may have allocated a genuine Valve global user/pipe.
+// Keep that private context for retry; never expose it as a ready engine or
+// guess a destructor slot in Valve's undocumented engine interface.
+static EngineContext Prepared,ActiveEngine;
+static _Atomic bool EngineReady;
+static pthread_mutex_t StartLock=PTHREAD_MUTEX_INITIALIZER;
 
 static void *Slot(void *object,int slot) { return (*(void ***)object)[slot]; }
 static const char *TypeName(void *object) {
@@ -34,56 +46,89 @@ static const char *ProxyMethodName(void *function) {
     }
     return NULL;
 }
-static int FindMethod(const char *name,void *image) {
+static int FindMethod(void *user,const char *name,void *image) {
     Dl_info base;
     if (!dladdr(image,&base)) return -1;
     for (int slot=0;slot<400;slot++) {
-        Dl_info info;void *function=Slot(User,slot);
+        Dl_info info;void *function=Slot(user,slot);
         if (!dladdr(function,&info) || info.dli_fbase!=base.dli_fbase) break; // end of vtable
         const char *found=ProxyMethodName(function);
         if (found && strcmp(found,name)==0) return slot;
     }
     return -1;
 }
-static void *Pump(void *unused) {
-    (void)unused;
-    for (;;) { ((void (*)(void *))Slot(Engine,19))(Engine);usleep(10000); } // RunFrame
+static void *Pump(void *engine) {
+    for (;;) { ((void (*)(void *))Slot(engine,19))(engine);usleep(10000); } // RunFrame
     return NULL;
 }
 bool AgePadEngineStart(void *image,char *error,unsigned long errorSize) {
-    if (User) return true; // one engine per process; later sign-ins reuse it
-    void *(*create)(const char *,int *)=(void *(*)(const char *,int *))dlsym(image,"CreateInterface");
-    int status=0;
-    Engine=create?create("CLIENTENGINE_INTERFACE_VERSION005",&status):NULL;
-    if (!Engine || !strstr(TypeName(Engine),"CSteamClient")) { snprintf(error,errorSize,"engine interface unavailable");return false; }
-    GlobalUser=((HSteamUser (*)(void *,HSteamPipe *))Slot(Engine,2))(Engine,&Pipe); // CreateGlobalUser
-    if (!GlobalUser || !Pipe) { snprintf(error,errorSize,"CreateGlobalUser failed");return false; }
-    User=((void *(*)(void *,HSteamUser,HSteamPipe))Slot(Engine,8))(Engine,GlobalUser,Pipe); // IClientUser
-    if (!User || strcmp(TypeName(User),"14IClientUserMap")) { snprintf(error,errorSize,"IClientUser not at the expected slot (%s)",User?TypeName(User):"null");return false; }
-    struct { const char *name;int *slot; } wanted[]={
-        {"LogOn",&Method.logOn},{"LogOff",&Method.logOff},{"BLoggedOn",&Method.loggedOn},
-        {"GetLogonState",&Method.logonState},{"BConnected",&Method.connected},{"GetSteamID",&Method.steamID},
-        {"SetLoginToken",&Method.setLoginToken},{"LogOnOffline",&Method.logOnOffline},{"BIsSubscribedApp",&Method.subscribed},
-        {"CanLogonOffline",&Method.canOffline}};
-    for (unsigned i=0;i<sizeof(wanted)/sizeof(*wanted);i++) {
-        *wanted[i].slot=FindMethod(wanted[i].name,(void *)create);
-        if (*wanted[i].slot<0) { snprintf(error,errorSize,"IClientUser::%s not found",wanted[i].name);return false; }
+    pthread_mutex_lock(&StartLock);
+    if (atomic_load_explicit(&EngineReady,memory_order_acquire)) {
+        pthread_mutex_unlock(&StartLock);return true;
     }
-    pthread_t thread;pthread_create(&thread,NULL,Pump,NULL);pthread_detach(thread);
-    return true;
+    bool ready=false;
+    if (!image) { snprintf(error,errorSize,"Steam client image missing");goto finish; }
+    if (Prepared.image && Prepared.image!=image) {
+        snprintf(error,errorSize,"a different Steam client requires restarting AgePad");goto finish;
+    }
+    void *(*create)(const char *,int *)=(void *(*)(const char *,int *))dlsym(image,"CreateInterface");
+    if (!Prepared.engine) {
+        int status=0;
+        void *engine=create?create("CLIENTENGINE_INTERFACE_VERSION005",&status):NULL;
+        if (!engine || !strstr(TypeName(engine),"CSteamClient")) {
+            snprintf(error,errorSize,"engine interface unavailable");goto finish;
+        }
+        if (!Slot(engine,2) || !Slot(engine,8) || !Slot(engine,19)) {
+            snprintf(error,errorSize,"engine methods unavailable");goto finish;
+        }
+        Prepared.image=image;Prepared.engine=engine;
+    }
+    if (!Prepared.globalUser || !Prepared.pipe) {
+        HSteamPipe pipe=0;
+        HSteamUser user=((HSteamUser (*)(void *,HSteamPipe *))Slot(Prepared.engine,2))(Prepared.engine,&pipe);
+        if (!user || !pipe) { snprintf(error,errorSize,"CreateGlobalUser failed");goto finish; }
+        Prepared.pipe=pipe;Prepared.globalUser=user;
+    }
+    void *user=((void *(*)(void *,HSteamUser,HSteamPipe))Slot(Prepared.engine,8))
+        (Prepared.engine,Prepared.globalUser,Prepared.pipe);
+    if (!user || strcmp(TypeName(user),"14IClientUserMap")) {
+        snprintf(error,errorSize,"IClientUser not at the expected slot (%s)",user?TypeName(user):"null");goto finish;
+    }
+    EngineMethods methods={0};
+    struct { const char *name;int *slot; } wanted[]={
+        {"LogOn",&methods.logOn},{"LogOff",&methods.logOff},{"BLoggedOn",&methods.loggedOn},
+        {"GetLogonState",&methods.logonState},{"BConnected",&methods.connected},{"GetSteamID",&methods.steamID},
+        {"SetLoginToken",&methods.setLoginToken},{"LogOnOffline",&methods.logOnOffline},{"BIsSubscribedApp",&methods.subscribed},
+        {"CanLogonOffline",&methods.canOffline}};
+    for (unsigned i=0;i<sizeof(wanted)/sizeof(*wanted);i++) {
+        *wanted[i].slot=FindMethod(user,wanted[i].name,(void *)create);
+        if (*wanted[i].slot<0) { snprintf(error,errorSize,"IClientUser::%s not found",wanted[i].name);goto finish; }
+    }
+    pthread_t thread;
+    int threadError=pthread_create(&thread,NULL,Pump,Prepared.engine);
+    if (threadError) { snprintf(error,errorSize,"Steam frame pump could not start (%d)",threadError);goto finish; }
+    pthread_detach(thread);
+    Prepared.user=user;Prepared.methods=methods;
+    ActiveEngine=Prepared;
+    atomic_store_explicit(&EngineReady,true,memory_order_release);
+    if (error && errorSize) error[0]=0;
+    ready=true;
+finish:
+    pthread_mutex_unlock(&StartLock);return ready;
 }
+static bool Ready(void) { return atomic_load_explicit(&EngineReady,memory_order_acquire); }
 void AgePadEngineSetLoginToken(const char *token,const char *account) {
-    ((void (*)(void *,const char *,const char *))Slot(User,Method.setLoginToken))(User,token,account);
+    if (Ready()) ((void (*)(void *,const char *,const char *))Slot(ActiveEngine.user,ActiveEngine.methods.setLoginToken))(ActiveEngine.user,token,account);
 }
-int AgePadEngineLogOn(uint64_t steamID) { return ((int (*)(void *,uint64_t))Slot(User,Method.logOn))(User,steamID); }
-int AgePadEngineLogOnOffline(void) { return ((int (*)(void *,bool))Slot(User,Method.logOnOffline))(User,true); }
-void AgePadEngineLogOff(void) { ((void (*)(void *))Slot(User,Method.logOff))(User); }
-bool AgePadEngineLoggedOn(void) { return User && ((bool (*)(void *))Slot(User,Method.loggedOn))(User); }
-bool AgePadEngineConnected(void) { return User && ((bool (*)(void *))Slot(User,Method.connected))(User); }
-int AgePadEngineLogonState(void) { return User?((int (*)(void *))Slot(User,Method.logonState))(User):-1; }
-uint64_t AgePadEngineSteamID(void) { return User?((uint64_t (*)(void *))Slot(User,Method.steamID))(User):0; }
-bool AgePadEngineOwnsApp(uint32_t appID) { return User && ((bool (*)(void *,uint32_t))Slot(User,Method.subscribed))(User,appID); }
-int AgePadEngineCanLogOnOffline(void) { return User?((int (*)(void *))Slot(User,Method.canOffline))(User):-1; }
+int AgePadEngineLogOn(uint64_t steamID) { return Ready()?((int (*)(void *,uint64_t))Slot(ActiveEngine.user,ActiveEngine.methods.logOn))(ActiveEngine.user,steamID):-1; }
+int AgePadEngineLogOnOffline(void) { return Ready()?((int (*)(void *,bool))Slot(ActiveEngine.user,ActiveEngine.methods.logOnOffline))(ActiveEngine.user,true):-1; }
+void AgePadEngineLogOff(void) { if (Ready()) ((void (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.logOff))(ActiveEngine.user); }
+bool AgePadEngineLoggedOn(void) { return Ready() && ((bool (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.loggedOn))(ActiveEngine.user); }
+bool AgePadEngineConnected(void) { return Ready() && ((bool (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.connected))(ActiveEngine.user); }
+int AgePadEngineLogonState(void) { return Ready()?((int (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.logonState))(ActiveEngine.user):-1; }
+uint64_t AgePadEngineSteamID(void) { return Ready()?((uint64_t (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.steamID))(ActiveEngine.user):0; }
+bool AgePadEngineOwnsApp(uint32_t appID) { return Ready() && ((bool (*)(void *,uint32_t))Slot(ActiveEngine.user,ActiveEngine.methods.subscribed))(ActiveEngine.user,appID); }
+int AgePadEngineCanLogOnOffline(void) { return Ready()?((int (*)(void *))Slot(ActiveEngine.user,ActiveEngine.methods.canOffline))(ActiveEngine.user):-1; }
 kern_return_t AgePadEngineRegister(const char *clientPath,kern_return_t (*lookUp)(mach_port_t,const char *,mach_port_t *)) {
     mach_port_t service=MACH_PORT_NULL;
     kern_return_t status=lookUp(bootstrap_port,"com.valvesoftware.steam.ipctool",&service);

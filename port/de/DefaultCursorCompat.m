@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <UIKit/UIKit.h>
+#include "HostGeometry.h"
 extern CGPoint DEUIKitPointerPosition(void);
 #import <CoreGraphics/CoreGraphics.h>
 #include <stdlib.h>
@@ -51,8 +52,7 @@ static CADisplayLink *DECursorDisplayLink;
 - (void)deUpdateCursor:(CADisplayLink *)link {
     NSCursor *cursor=[NSCursor currentCursor];
     if(!cursor->_deImage || !DECursorView.superview)return;
-    UIWindow *window=DECursorView.window;
-    CGPoint p=[window convertPoint:DEUIKitPointerPosition() fromCoordinateSpace:window.screen.coordinateSpace];
+    CGPoint p=DEUIKitPointerPosition();
     CGRect frame=DECursorView.frame;frame.origin=CGPointMake(p.x-cursor->_deHotSpot.x,p.y-cursor->_deHotSpot.y);DECursorView.frame=frame;
     [DECursorView.superview bringSubviewToFront:DECursorView];
 }
@@ -61,7 +61,7 @@ static CADisplayLink *DECursorDisplayLink;
     dispatch_async(dispatch_get_main_queue(),^{
         @synchronized(NSCursor.class) { DECurrentCursor=self; }
         if(!self->_deImage){DECursorView.hidden=YES;return;}
-        UIWindow *window=nil;for(UIWindow *candidate in UIApplication.sharedApplication.windows)if(candidate.isKeyWindow){window=candidate;break;}
+        UIWindow *window=DEHostWindow();
         if(!window)DEUnsupported("custom cursor requires UIKit window");
         CGImageRef pixels=((CGImageRef(*)(id,SEL,CGRect *,id,id))objc_msgSend)(self->_deImage,sel_registerName("CGImageForProposedRect:context:hints:"),NULL,nil,nil);
         CGSize size=((CGSize(*)(id,SEL))objc_msgSend)(self->_deImage,sel_registerName("size"));

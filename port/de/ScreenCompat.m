@@ -3,7 +3,7 @@
 #include "UnsupportedBoundary.h"
 #include "RenderScale.h"
 @interface NSScreen : NSObject
-@property(nonatomic,strong) UIScreen *uiScreen;
+@property(nonatomic,weak) UIScreen *uiScreen;
 @property(nonatomic) uint32_t displayIdentifier;
 + (NSArray<NSScreen *> *)screens;
 + (NSScreen *)mainScreen;
@@ -11,9 +11,14 @@
 static NSMapTable<UIScreen *,NSScreen *> *wrappers;
 static NSScreen *DEWrapScreen(UIScreen *screen) {
     static dispatch_once_t once;
-    dispatch_once(&once,^{ wrappers=[NSMapTable strongToStrongObjectsMapTable]; });
+    dispatch_once(&once,^{ wrappers=[NSMapTable weakToStrongObjectsMapTable]; });
     static uint32_t nextIdentifier=1;
     @synchronized(wrappers) {
+        // Legacy engines default to the first display identifier. Reserve it
+        // for the scene's actual display, even when UIKit lists the closed
+        // outer panel first or another bridge asks about that panel first.
+        UIScreen *host=DEHostScreen();
+        if(host && host!=screen && ![wrappers objectForKey:host])DEWrapScreen(host);
         NSScreen *wrapper=[wrappers objectForKey:screen];
         if (!wrapper) {
             wrapper=[NSScreen new]; wrapper.uiScreen=screen;
@@ -28,13 +33,17 @@ uint32_t DEUIKitDisplayIdentifier(UIScreen *screen) { return screen?DEWrapScreen
 @implementation NSScreen
 + (NSArray<NSScreen *> *)screens {
     NSMutableArray *result=[NSMutableArray array];
-    for (UIScreen *screen in UIScreen.screens) [result addObject:DEWrapScreen(screen)];
+    for (UIScreen *screen in DEHostScreens()) [result addObject:DEWrapScreen(screen)];
     return result;
 }
-+ (NSScreen *)mainScreen { return self.screens.firstObject; }
++ (NSScreen *)mainScreen {
+    // On a two-display device, the active scene identifies the game display.
+    UIScreen *screen=DEHostScreen();
+    return screen?DEWrapScreen(screen):self.screens.firstObject;
+}
 + (BOOL)screensHaveSeparateSpaces { return NO; } // No macOS Spaces in UIKit.
-- (CGRect)frame { return self.uiScreen.bounds; }
-- (CGRect)visibleFrame { return self.uiScreen.bounds; } // No desktop menu/Dock exclusion.
+- (CGRect)frame { return DEGameBoundsForScreen(self.uiScreen); }
+- (CGRect)visibleFrame { return self.frame; } // No desktop menu/Dock exclusion.
 - (CGFloat)backingScaleFactor { return DERenderScale(self.uiScreen); }
 - (NSTimeInterval)minimumRefreshInterval {
  NSInteger fps=self.uiScreen.maximumFramesPerSecond;

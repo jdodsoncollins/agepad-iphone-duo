@@ -26,6 +26,7 @@ if '(from CoreServices)' in imports:
 shim = out/'IPCSystemCompat.dylib'
 subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-target', 'arm64-apple-ios26.0-simulator',
     '-isysroot', str(sdk), '-dynamiclib', str(repo/'port/de/IPCSystemCompat.c'),
+    '-framework', 'CoreFoundation',
     '-Wl,-reexport_library,'+str(sdk/'usr/lib/libSystem.tbd'),
     '-Wl,-install_name,@rpath/IPCSystemCompat.dylib', '-Wl,-compatibility_version,1.0', '-o', str(shim)], check=True)
 subprocess.run(['codesign', '--force', '--sign', '-', str(shim)], check=True)

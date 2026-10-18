@@ -34,6 +34,12 @@ def main():
     parser.add_argument('--trace-input-consumer', action='store_true')
     parser.add_argument('--trace-pointer', action='store_true',
                         help='Log UIKit touch details and captured hardware button masks')
+    parser.add_argument('--trace-host-geometry', action='store_true',
+                        help='Log live scene/window/host frames across resize and display changes')
+    parser.add_argument('--trace-resource-files', metavar='MATCH',
+                        help='Trace real resource file queries whose path contains MATCH (for example widgetui)')
+    parser.add_argument('--hud-input-regions', type=Path,
+                        help='Opt-in, viewport- and layout-hash-guarded HUD touch-region manifest')
     parser.add_argument('--graphics-wait-pump-ms', type=float,
                         help='Run-loop pump interval for main-thread GPU waits (default 1 ms; the earlier build used 5)')
     args = parser.parse_args()
@@ -69,10 +75,20 @@ def main():
     if args.trace_pointer:
         env['SIMCTL_CHILD_AGEPAD_BUTTON_MASK_TRACE'] = '1'
         env['SIMCTL_CHILD_AGEPAD_TOUCH_DETAIL_TRACE'] = '1'
+    if args.trace_host_geometry:
+        env['SIMCTL_CHILD_AGEPAD_HOST_GEOMETRY_TRACE'] = '1'
+    if args.trace_resource_files:
+        env['SIMCTL_CHILD_AGEPAD_RESOURCE_FILE_TRACE'] = '1'
+        env['SIMCTL_CHILD_AGEPAD_RESOURCE_FILE_TRACE_MATCH'] = args.trace_resource_files
+    if args.hud_input_regions:
+        regions = args.hud_input_regions.expanduser().resolve()
+        if not regions.is_file():
+            parser.error('Missing HUD input-region manifest: ' + str(regions))
+        env['SIMCTL_CHILD_AGEPAD_HUD_INPUT_REGIONS'] = str(regions)
     if args.trace_sld_frames:
         env['SIMCTL_CHILD_AGEPAD_SLD_PARSE_TRACE'] = '1'
         env['SIMCTL_CHILD_AGEPAD_SLD_FRAME_TRACE'] = '1'
-        env['SIMCTL_CHILD_AGEPAD_SLD_FRAME_TRACE_ARM'] = str(PACKAGE / args.name / 'trace-frames.arm')
+        env['SIMCTL_CHILD_AGEPAD_SLD_FRAME_TRACE_ARM'] = str(package / args.name / 'trace-frames.arm')
     libraries = ['SystemFrameworkCompat', 'SignalTrace', 'MainThreadGraphicsWait',
                  'ResourceFileTrace', 'OriginalInputTrace', 'AudioOutputCompat']
     if args.trace_input_consumer:

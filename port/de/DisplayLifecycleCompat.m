@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <stdint.h>
+#include "HostGeometry.h"
 
 // A single UIKit display cannot be mirrored inside this host. Returning the
 // real topology fact lets the original activation path continue without
@@ -17,7 +18,7 @@ extern uint32_t DEUIKitDisplayIdentifier(UIScreen *screen);
 int32_t DECGGetOnlineDisplayList(uint32_t maxDisplays,uint32_t *displays,uint32_t *count) __asm__("_CGGetOnlineDisplayList");
 int32_t DECGGetOnlineDisplayList(uint32_t maxDisplays,uint32_t *displays,uint32_t *count) {
     uint32_t found=0;
-    for (UIScreen *screen in UIScreen.screens) {
+    for (UIScreen *screen in DEHostScreens()) {
         if (displays && found<maxDisplays) displays[found]=DEUIKitDisplayIdentifier(screen);
         found++;
     }

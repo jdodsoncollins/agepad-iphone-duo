@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Find the signing setup for AgePad on a connected iPad.
+"""Find the signing setup for AgePad on a connected iPhone or iPad.
 
 Looks through the provisioning profiles Xcode has downloaded for one that is
 current, covers the bundle ID, grants the increased memory limit, includes this
-iPad, and whose certificate has a private key in this Mac's keychain. Prints
+device, and whose certificate has a private key in this Mac's keychain. Prints
 the profile path and the signing identity hash on two lines, or explains what
 is missing (exit 1).
 """
@@ -42,7 +42,7 @@ for profile in sorted((p for folder in folders if folder.is_dir() for p in folde
     if not entitlements.get(memory):
         reasons.add('the profile does not include the Increased Memory Limit capability'); continue
     if udid not in data.get('ProvisionedDevices', []) and not data.get('ProvisionsAllDevices'):
-        reasons.add('this iPad is not in the profile (register it, then download the profile again)'); continue
+        reasons.add('this device is not in the profile (register it, then download the profile again)'); continue
     for certificate in data.get('DeveloperCertificates', []):
         sha1 = hashlib.sha1(certificate).hexdigest().upper()
         if sha1 in keychain:

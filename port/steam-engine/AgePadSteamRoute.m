@@ -3,6 +3,7 @@
 #import <Network/Network.h>
 #include "SteamEngineHost.h"
 #import "SteamQRSignIn.h"
+#import "SteamContentClient.h"
 
 static NSString *const KeychainService=@"AgePad Steam sign-in";
 static dispatch_queue_t EngineQueue(void) {
@@ -161,14 +162,29 @@ static NSDictionary *KeychainQuery(NSString *account) {
     return @{(__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
              (__bridge id)kSecAttrService:KeychainService,(__bridge id)kSecAttrAccount:account};
 }
-static void SaveToken(NSString *account,NSString *token) {
-    SecItemDelete((__bridge CFDictionaryRef)KeychainQuery(account));
+static BOOL SaveToken(NSString *account,NSString *token) {
     NSMutableDictionary *item=[KeychainQuery(account) mutableCopy];
     item[(__bridge id)kSecValueData]=[token dataUsingEncoding:NSUTF8StringEncoding];
-    item[(__bridge id)kSecAttrAccessible]=(__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    item[(__bridge id)kSecAttrAccessible]=(__bridge id)kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
+    item[(__bridge id)kSecAttrSynchronizable]=@NO;
     OSStatus status=SecItemAdd((__bridge CFDictionaryRef)item,NULL);
+    if (status==errSecDuplicateItem) status=SecItemUpdate((__bridge CFDictionaryRef)KeychainQuery(account),
+        (__bridge CFDictionaryRef)@{(__bridge id)kSecValueData:item[(__bridge id)kSecValueData],
+            (__bridge id)kSecAttrAccessible:item[(__bridge id)kSecAttrAccessible]});
     fprintf(stderr,"AGEPAD_STEAM_SIGNIN_SAVED keychain=%d\n",(int)status);
+    return status==errSecSuccess;
 }
+
+@interface AgePadSteamSignInPanel : UIStackView
+@property(nonatomic,copy) void (^signedIn)(void);
+@property(nonatomic,strong) AgePadSteamSignInRequest *attempt;
+@property(nonatomic,strong) UIImageView *code;
+@property(nonatomic,strong) UIView *qrContainer;
+@property(nonatomic,strong) UILabel *state;
+@property(nonatomic,strong) UIButton *retry,*passwordButton;
+@property(nonatomic) BOOL wasAttached,finished;
+- (void)beginQR;
+@end
 static NSString *LoadToken(NSString *account) {
     NSMutableDictionary *query=[KeychainQuery(account) mutableCopy];
     query[(__bridge id)kSecReturnData]=@YES;
@@ -178,6 +194,20 @@ static NSString *LoadToken(NSString *account) {
 }
 
 @implementation AgePadSteamRoute
++ (void)prepareContentDownload:(AgePadSteamContentClient *)client profile:(NSDictionary *)profile
+    completion:(void (^)(NSDictionary *,NSError *))completion progress:(void (^)(NSString *))progress {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool {
+        const char *savedID=getenv("AGEPAD_STEAM_ENGINE_ID");NSString *identity=savedID?@(savedID):@"";
+        NSString *token=identity.length?LoadToken(identity):nil;NSError *error=nil;NSDictionary *plan=nil;
+        if(!token.length||!AgePadEngineLoggedOn()||!AgePadEngineConnected()||!AgePadEngineOwnsApp(813780))
+            error=[NSError errorWithDomain:@"AgePadSteamContent" code:1 userInfo:@{NSLocalizedDescriptionKey:@"Connect to Steam online and verify your library before downloading."}];
+        else {
+            NSString *manifest=[NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"SteamAppManifest_813780" ofType:@"acf"] encoding:NSUTF8StringEncoding error:NULL];
+            plan=[client prepareProfile:profile appManifest:manifest?:@"" token:token steamID:strtoull(identity.UTF8String,NULL,10) account:self.accountName progress:progress error:&error];
+        }
+        completion(plan,error);
+    }});
+}
 + (BOOL)hasAccount { return getenv("AGEPAD_STEAM_ENGINE_ID")!=NULL; }
 + (NSString *)accountName { const char *name=getenv("AGEPAD_STEAM_ENGINE_NAME");return name?@(name):@""; }
 + (void)forgetAccount {
@@ -207,13 +237,25 @@ static NSString *LoadToken(NSString *account) {
         }
     });
 }
-+ (void)saveSignIn:(NSDictionary *)signIn {
++ (BOOL)saveSignIn:(NSDictionary *)signIn error:(NSString **)error {
     NSString *steamID=signIn[AgePadSteamID64],*name=signIn[AgePadSteamAccountName];
-    SaveToken(steamID,signIn[AgePadSteamRefreshToken]);
+    if (!steamID.length || !name.length || name.length>128 ||
+        [name rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location!=NSNotFound ||
+        [name containsString:@"\0"] || ![signIn[AgePadSteamRefreshToken] length]) {
+        if (error) *error=@"Steam returned incomplete account details. Try signing in again.";return NO;
+    }
+    if (!SaveToken(steamID,signIn[AgePadSteamRefreshToken])) {
+        if (error) *error=@"Couldn't save your Steam sign-in securely. Unlock this device and try again.";return NO;
+    }
     NSString *file=[NSString stringWithFormat:@"AGEPAD_STEAM_ENGINE_ID=%@\nAGEPAD_STEAM_ENGINE_NAME=%@\n",steamID,name];
-    [file writeToFile:AccountFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (![file writeToFile:AccountFile() atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        if (error) *error=@"Couldn't save the account record. Check free space and try again.";return NO;
+    }
+    [NSFileManager.defaultManager setAttributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication}
+        ofItemAtPath:AccountFile() error:nil];
     setenv("AGEPAD_STEAM_ENGINE_ID",steamID.UTF8String,1);setenv("AGEPAD_STEAM_ENGINE_NAME",name.UTF8String,1);
     [NSUserDefaults.standardUserDefaults setObject:name forKey:@"AgePadSteamAccountName"];
+    return YES;
 }
 + (void)startWithClient:(void *)client path:(NSString *)clientPath lookUp:(AgePadBootstrapLookUp)lookUp
                  status:(void (^)(NSString *))status completion:(void (^)(NSString *))completion {
@@ -314,98 +356,176 @@ static NSString *LoadToken(NSString *account) {
         finish(registered==KERN_SUCCESS?nil:@"Steam started, but the game couldn't be connected to it.");
     });
 }
-+ (UIView *)signInViewWithCompletion:(void (^)(void))signedIn {
-    UIStackView *panel=[UIStackView new];
-    panel.axis=UILayoutConstraintAxisVertical;panel.spacing=14;panel.alignment=UIStackViewAlignmentLeading;
-    UILabel *title=[UILabel new];
-    title.text=@"Sign in to Steam";title.font=[UIFont systemFontOfSize:26 weight:UIFontWeightBold];title.textColor=UIColor.whiteColor;
+ + (UIView *)signInViewWithCompletion:(void (^)(void))signedIn {
+    AgePadSteamSignInPanel *panel=[AgePadSteamSignInPanel new];
+    panel.signedIn=signedIn;
+    return panel;
+}
+@end
+
+@implementation AgePadSteamSignInPanel
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self=[super initWithFrame:frame])) return nil;
+    self.axis=UILayoutConstraintAxisVertical;self.spacing=14;self.alignment=UIStackViewAlignmentFill;
+    UILabel *title=[UILabel new];title.text=@"Sign in to Steam";title.numberOfLines=0;
+    title.font=[UIFont preferredFontForTextStyle:UIFontTextStyleTitle1];title.textColor=UIColor.whiteColor;
     UILabel *how=[UILabel new];how.numberOfLines=0;
-    how.text=@"On your phone, open the Steam app, tap the Steam Guard shield, then scan this code. You only do this once; AgePad remembers the sign-in on this iPad and never sees your password.";
-    how.font=[UIFont systemFontOfSize:18];how.textColor=[UIColor colorWithRed:.75 green:.81 blue:.84 alpha:1];
-    UIImageView *code=[UIImageView new];
-    code.backgroundColor=UIColor.whiteColor;code.layer.magnificationFilter=kCAFilterNearest;
-    [code.widthAnchor constraintEqualToConstant:300].active=YES;[code.heightAnchor constraintEqualToConstant:300].active=YES;
-    UILabel *state=[UILabel new];state.numberOfLines=0;
-    state.text=@"Getting a sign-in code…";state.font=[UIFont systemFontOfSize:17 weight:UIFontWeightMedium];state.textColor=UIColor.whiteColor;
+    how.text=@"Sign in here, then confirm with Steam Guard. QR sign-in requires Steam Guard on another device.";
+    how.font=[UIFont preferredFontForTextStyle:UIFontTextStyleBody];how.textColor=[UIColor colorWithRed:.75 green:.81 blue:.84 alpha:1];
+    self.code=[UIImageView new];self.code.backgroundColor=UIColor.whiteColor;
+    self.code.contentMode=UIViewContentModeScaleAspectFit;
+    [self.code setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [self.code setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisVertical];
+    self.code.layer.magnificationFilter=kCAFilterNearest;self.code.translatesAutoresizingMaskIntoConstraints=NO;
+    UIView *qr=[UIView new];self.qrContainer=qr;qr.hidden=YES;[qr addSubview:self.code];
+    NSLayoutConstraint *preferred=[self.code.widthAnchor constraintEqualToConstant:240];preferred.priority=750;
+    [NSLayoutConstraint activateConstraints:@[preferred,
+        [self.code.widthAnchor constraintLessThanOrEqualToAnchor:qr.widthAnchor],
+        [self.code.heightAnchor constraintEqualToAnchor:self.code.widthAnchor],
+        [self.code.centerXAnchor constraintEqualToAnchor:qr.centerXAnchor],
+        [self.code.topAnchor constraintEqualToAnchor:qr.topAnchor],
+        [self.code.bottomAnchor constraintEqualToAnchor:qr.bottomAnchor]]];
+    self.state=[UILabel new];self.state.numberOfLines=0;self.state.textColor=UIColor.whiteColor;
+    self.state.font=[UIFont preferredFontForTextStyle:UIFontTextStyleBody];self.state.accessibilityTraits|=UIAccessibilityTraitUpdatesFrequently;
+    self.retry=[self button:@"Use QR on another device" action:@selector(beginQR)];
+    self.passwordButton=[self button:@"Sign in with account name and password" action:@selector(passwordSignIn)];
+    UIButtonConfiguration *primary=UIButtonConfiguration.filledButtonConfiguration;
+    primary.title=@"Sign in with account name and password";
+    primary.baseBackgroundColor=[UIColor colorWithRed:.88 green:.71 blue:.40 alpha:1];
+    primary.baseForegroundColor=UIColor.blackColor;self.passwordButton.configuration=primary;
+    for (UIView *view in @[title,how,self.passwordButton,self.retry,qr,self.state]) [self addArrangedSubview:view];
+    return self;
+}
+- (UIButton *)button:(NSString *)title action:(SEL)action {
     UIButtonConfiguration *style=UIButtonConfiguration.plainButtonConfiguration;
-    style.baseForegroundColor=[UIColor colorWithRed:.88 green:.71 blue:.40 alpha:1];
-    style.title=@"No phone app? Sign in with your password instead";
-    style.contentInsets=NSDirectionalEdgeInsetsZero;
-    UIButton *passwordButton=[UIButton buttonWithConfiguration:style primaryAction:nil];
-    for (UIView *view in @[title,how,code,state,passwordButton]) [panel addArrangedSubview:view];
-    // Whichever sign-in (QR or password) finishes first completes the panel.
-    __block BOOL done=NO;
-    void (^succeed)(NSDictionary *)=^(NSDictionary *signIn) {
+    style.baseForegroundColor=[UIColor colorWithRed:.88 green:.71 blue:.40 alpha:1];style.title=title;
+    style.contentInsets=NSDirectionalEdgeInsetsMake(10,0,10,0);
+    UIButton *button=[UIButton buttonWithConfiguration:style primaryAction:nil];
+    button.titleLabel.numberOfLines=0;
+    [button.heightAnchor constraintGreaterThanOrEqualToConstant:44].active=YES;
+    [button addTarget:self action:action forControlEvents:UIControlEventPrimaryActionTriggered];return button;
+}
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window) self.wasAttached=YES;
+    else if (self.wasAttached) {
+        // A window/scene transition is not removal of this sign-in panel.
+        // Defer one turn so UIStackView reparenting can finish as well.
+        __weak typeof(self) weakSelf=self;
         dispatch_async(dispatch_get_main_queue(),^{
-            if (done) return;
-            done=YES;
-            fprintf(stderr,"AGEPAD_STEAM_SIGNIN_OK\n");
-            [self saveSignIn:signIn];
-            state.text=[NSString stringWithFormat:@"Signed in as %@.",signIn[AgePadSteamAccountName]];
-            signedIn();
+            AgePadSteamSignInPanel *panel=weakSelf;
+            if(panel && AgePadSteamShouldCancelDetachedPanel(panel.wasAttached,panel.window!=nil,panel.superview!=nil)) {
+                panel.finished=YES;[panel.attempt cancel];panel.attempt=nil;
+                fprintf(stderr,"AGEPAD_STEAM_PANEL_REMOVED cancelled=1\n");
+            }
+        });
+    }
+}
+- (void)dealloc { [_attempt cancel]; }
+- (BOOL)accepts:(AgePadSteamSignInRequest *)attempt { return !self.finished && self.attempt==attempt && !attempt.cancelled; }
+- (void)complete:(NSDictionary *)signIn error:(NSString *)error attempt:(AgePadSteamSignInRequest *)attempt {
+    if (![self accepts:attempt]) return;
+    fprintf(stderr,"AGEPAD_STEAM_AUTH_COMPLETE token_received=%d cancelled=%d\n",signIn!=nil,attempt.cancelled);
+    if (signIn && [AgePadSteamRoute saveSignIn:signIn error:&error]) {
+        self.finished=YES;[attempt cancel];self.code.image=nil;self.qrContainer.hidden=YES;
+        self.passwordButton.enabled=NO;self.retry.enabled=NO;
+        self.state.text=[NSString stringWithFormat:@"Signed in as %@.",signIn[AgePadSteamAccountName]];
+        fprintf(stderr,"AGEPAD_STEAM_SIGNIN_OK\n");
+        if (self.signedIn) self.signedIn();
+    } else {
+        self.code.image=nil;self.qrContainer.hidden=YES;
+        self.passwordButton.enabled=YES;self.retry.enabled=YES;
+        self.state.text=error?:@"Sign-in didn't finish. Choose a sign-in method to try again.";
+    }
+}
+- (AgePadSteamSignInRequest *)newAttempt {
+    [self.attempt cancel];self.attempt=[AgePadSteamSignInRequest new];
+    AgePadSteamSignInRequest *attempt=self.attempt;
+    __weak typeof(self) weakSelf=self;
+    __weak AgePadSteamSignInRequest *weakAttempt=attempt;
+    attempt.progress=^(NSString *message) { dispatch_async(dispatch_get_main_queue(),^{
+        if([weakSelf accepts:weakAttempt])weakSelf.state.text=message;
+    }); };
+    self.code.image=nil;self.qrContainer.hidden=YES;return attempt;
+}
+- (void)beginQR {
+    if (self.finished) return;
+    AgePadSteamSignInRequest *attempt=[self newAttempt];
+    UIButtonConfiguration *retryStyle=[self.retry.configuration copy];retryStyle.title=@"Get a new QR code";self.retry.configuration=retryStyle;
+    self.state.text=@"Getting a sign-in code…";self.passwordButton.enabled=YES;self.retry.enabled=YES;
+    __weak typeof(self) weakSelf=self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+        NSString *error=nil;
+        NSDictionary *signIn=AgePadSteamQRSignInWithRequest(@"AgePad (iOS)",600,attempt,^(NSString *challenge) {
+            UIImage *image=[UIImage imageWithData:AgePadSteamQRPNG(challenge,600)];
+            dispatch_async(dispatch_get_main_queue(),^{
+                AgePadSteamSignInPanel *panel=weakSelf;if (![panel accepts:attempt]) return;
+                panel.code.image=image;panel.qrContainer.hidden=image==nil;
+                panel.state.text=@"Scan this code using Steam Guard on another device, then approve the request there.";
+            });
+        },&error);
+        dispatch_async(dispatch_get_main_queue(),^{ [weakSelf complete:signIn error:error attempt:attempt]; });
+    });
+}
+- (UIViewController *)presentingController {
+    UIViewController *host=self.window.rootViewController;
+    while (host.presentedViewController) host=host.presentedViewController;return host;
+}
+- (void)passwordSignIn {
+    UIViewController *host=[self presentingController];if (!host || self.finished) return;
+    [self.attempt cancel];self.attempt=nil;self.code.image=nil;self.qrContainer.hidden=YES;
+    self.state.text=@"Enter your Steam account details in the sign-in form.";
+    UIButtonConfiguration *retryStyle=[self.retry.configuration copy];retryStyle.title=@"Use QR on another device";self.retry.configuration=retryStyle;
+    UIAlertController *form=[UIAlertController alertControllerWithTitle:@"Sign in to Steam"
+        message:@"Your password is encrypted with Steam's key and sent only to Steam. AgePad doesn't save it." preferredStyle:UIAlertControllerStyleAlert];
+    [form addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder=@"Steam account name";field.autocapitalizationType=UITextAutocapitalizationTypeNone;
+        field.autocorrectionType=UITextAutocorrectionTypeNo;field.textContentType=UITextContentTypeUsername; }];
+    [form addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder=@"Password";field.secureTextEntry=YES;field.textContentType=UITextContentTypePassword; }];
+    [form addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;__weak UIAlertController *weakForm=form;
+    void (^submit)(BOOL)=^(BOOL prefersGuardCode) {
+        AgePadSteamSignInPanel *panel=weakSelf;if (!panel || panel.finished) return;
+        NSString *account=weakForm.textFields[0].text,*password=weakForm.textFields[1].text;
+        weakForm.textFields[1].text=@"";
+        AgePadSteamSignInRequest *attempt=[panel newAttempt];panel.passwordButton.enabled=NO;panel.retry.enabled=YES;
+        attempt.prefersGuardCode=prefersGuardCode;
+        panel.state.text=@"Signing in to Steam…";
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+            NSString *error=nil;
+            NSDictionary *signIn=AgePadSteamPasswordSignInWithRequest(account,password,@"AgePad (iOS)",attempt,^NSString *(int codeType) {
+                __block NSString *entered=nil;dispatch_semaphore_t answered=dispatch_semaphore_create(0);
+                __block UIAlertController *guard=nil;
+                dispatch_async(dispatch_get_main_queue(),^{
+                    AgePadSteamSignInPanel *current=weakSelf;
+                    if (![current accepts:attempt]) { dispatch_semaphore_signal(answered);return; }
+                    guard=[UIAlertController alertControllerWithTitle:@"Steam Guard code"
+                        message:codeType==2?@"Enter the code Steam emailed you.":@"Enter the code from Steam Guard in the Steam app."
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [guard addTextFieldWithConfigurationHandler:^(UITextField *field) {
+                        field.autocapitalizationType=UITextAutocapitalizationTypeAllCharacters;field.textContentType=UITextContentTypeOneTimeCode; }];
+                    __weak UIAlertController *weakGuard=guard;
+                    [guard addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *c) { dispatch_semaphore_signal(answered); }]];
+                    [guard addAction:[UIAlertAction actionWithTitle:@"Continue" style:UIAlertActionStyleDefault handler:^(UIAlertAction *c) {
+                        entered=weakGuard.textFields[0].text;dispatch_semaphore_signal(answered); }]];
+                    [[current presentingController] presentViewController:guard animated:YES completion:nil];
+                });
+                NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:300];
+                while (dispatch_semaphore_wait(answered,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_MSEC*100))) {
+                    if (attempt.cancelled || deadline.timeIntervalSinceNow<=0) {
+                        dispatch_async(dispatch_get_main_queue(),^{ [guard dismissViewControllerAnimated:YES completion:nil]; });return nil;
+                    }
+                }
+                return entered;
+            },^{ dispatch_async(dispatch_get_main_queue(),^{
+                if ([weakSelf accepts:attempt]) weakSelf.state.text=@"Approve the sign-in request in Steam Guard, then return to AgePad…";
+            }); },&error);
+            dispatch_async(dispatch_get_main_queue(),^{ [weakSelf complete:signIn error:error attempt:attempt]; });
         });
     };
-    __weak UIStackView *weakPanel=panel;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
-        while (weakPanel && !done) {
-            NSString *error=nil;
-            NSDictionary *signIn=AgePadSteamQRSignIn(@"AgePad (iPad)",280,^(NSString *challenge) {
-                UIImage *image=[UIImage imageWithData:AgePadSteamQRPNG(challenge,600)];
-                dispatch_async(dispatch_get_main_queue(),^{ if (!done) { code.image=image;state.text=@"Waiting for you to approve on your phone. The code refreshes by itself."; } });
-            },&error);
-            if (signIn) { succeed(signIn);return; }
-            fprintf(stderr,"AGEPAD_STEAM_SIGNIN_RETRY %s\n",error.UTF8String);
-            dispatch_async(dispatch_get_main_queue(),^{ if (!done) state.text=@"Getting a new code…"; });
-            sleep(error && [error containsString:@"timed out"]?1:5);
-        }
-    });
-    // Password + Steam Guard. The password stays in this alert's memory, is
-    // encrypted with Steam's key and sent once; it is never saved or logged.
-    __weak UIButton *weakButton=passwordButton;
-    [passwordButton addAction:[UIAction actionWithHandler:^(UIAction *action) {
-        UIViewController *host=weakButton.window.rootViewController;
-        while (host.presentedViewController) host=host.presentedViewController;
-        UIAlertController *form=[UIAlertController alertControllerWithTitle:@"Sign in to Steam"
-            message:@"Your password is sent only to Steam, encrypted. AgePad doesn't keep it." preferredStyle:UIAlertControllerStyleAlert];
-        [form addTextFieldWithConfigurationHandler:^(UITextField *field) {
-            field.placeholder=@"Steam account name";field.autocapitalizationType=UITextAutocapitalizationTypeNone;
-            field.autocorrectionType=UITextAutocorrectionTypeNo;field.textContentType=UITextContentTypeUsername; }];
-        [form addTextFieldWithConfigurationHandler:^(UITextField *field) {
-            field.placeholder=@"Password";field.secureTextEntry=YES;field.textContentType=UITextContentTypePassword; }];
-        [form addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        __weak UIAlertController *weakForm=form;
-        [form addAction:[UIAlertAction actionWithTitle:@"Sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            NSString *account=weakForm.textFields[0].text,*password=weakForm.textFields[1].text;
-            state.text=@"Signing in…";
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
-                NSString *error=nil;
-                NSDictionary *signIn=AgePadSteamPasswordSignIn(account,password,@"AgePad (iPad)",^NSString *(int codeType) {
-                    __block NSString *entered=nil;
-                    dispatch_semaphore_t answered=dispatch_semaphore_create(0);
-                    dispatch_async(dispatch_get_main_queue(),^{
-                        UIAlertController *guard=[UIAlertController alertControllerWithTitle:@"Steam Guard code"
-                            message:codeType==2?@"Enter the code Steam emailed you.":@"Enter the code from the Steam app (Steam Guard)."
-                            preferredStyle:UIAlertControllerStyleAlert];
-                        [guard addTextFieldWithConfigurationHandler:^(UITextField *field) {
-                            field.autocapitalizationType=UITextAutocapitalizationTypeAllCharacters;field.textContentType=UITextContentTypeOneTimeCode; }];
-                        __weak UIAlertController *weakGuard=guard;
-                        [guard addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *c) { dispatch_semaphore_signal(answered); }]];
-                        [guard addAction:[UIAlertAction actionWithTitle:@"Continue" style:UIAlertActionStyleDefault handler:^(UIAlertAction *c) {
-                            entered=weakGuard.textFields[0].text;dispatch_semaphore_signal(answered); }]];
-                        [host presentViewController:guard animated:YES completion:nil];
-                    });
-                    dispatch_semaphore_wait(answered,DISPATCH_TIME_FOREVER);
-                    return entered;
-                },^{
-                    dispatch_async(dispatch_get_main_queue(),^{ state.text=@"Approve the sign-in in the Steam app on your phone…"; });
-                },&error);
-                if (signIn) { succeed(signIn);return; }
-                fprintf(stderr,"AGEPAD_STEAM_PASSWORD_SIGNIN_FAILED %s\n",error.UTF8String);
-                dispatch_async(dispatch_get_main_queue(),^{ if (!done) state.text=error?:@"Sign-in didn't finish."; });
-            });
-        }]];
-        [host presentViewController:form animated:YES completion:nil];
-    }] forControlEvents:UIControlEventPrimaryActionTriggered];
-    return panel;
+    [form addAction:[UIAlertAction actionWithTitle:@"Sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { submit(NO); }]];
+    [form addAction:[UIAlertAction actionWithTitle:@"Use Steam Guard code" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { submit(YES); }]];
+    [host presentViewController:form animated:YES completion:nil];
 }
 @end

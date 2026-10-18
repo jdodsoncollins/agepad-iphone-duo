@@ -5,6 +5,10 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include "UnsupportedBoundary.h"
+#include "HostMetalMetadata.h"
+#include <TargetConditionals.h>
+#include <errno.h>
+#include <stdlib.h>
 // Defined below; adapters installed on shared Metal classes consult it so
 // system frameworks keep the platform implementation.
 static BOOL DEAppImageCaller(const void *caller);
@@ -126,8 +130,19 @@ static NSUInteger DEUnspecifiedDeviceLocation(id device,SEL selector) {
     return NSUIntegerMax; // MTLDeviceLocationUnspecified in the native SDK.
 }
 static IMP DEOriginalWorkingSet;
+static uint64_t DEConfiguredGameWorkingSet;
 static uint64_t DEBackingWorkingSet(id<MTLDevice> device,SEL selector) {
     uint64_t reported=((uint64_t(*)(id,SEL))DEOriginalWorkingSet)(device,selector);
+    // This is an advisory cache policy for the imported game, not a new GPU
+    // capability or an allocation guarantee. System-framework callers retain
+    // the native recommendation. An unknown native value stays unknown.
+    if(reported && DEConfiguredGameWorkingSet && DEAppImageCaller(__builtin_return_address(0))) {
+        uint64_t budget=MIN(reported,DEConfiguredGameWorkingSet);
+        static unsigned traces;
+        if(traces++<8)fprintf(stderr,"DE_GAME_GPU_BUDGET native_mb=%llu game_mb=%llu policy=advisory\n",
+            (unsigned long long)(reported>>20),(unsigned long long)(budget>>20));
+        return budget;
+    }
     if(reported)return reported;
     const char *path=getenv("AGEPAD_HOST_METAL_METADATA");
     NSData *data=path?[NSData dataWithContentsOfFile:@(path)]:nil;
@@ -147,7 +162,14 @@ static uint64_t DEBackingWorkingSet(id<MTLDevice> device,SEL selector) {
     return reported;
 }
 static void DEInstallWorkingSet(id<MTLDevice> device) {
-    if(!getenv("AGEPAD_BACKING_WORKING_SET") || DEOriginalWorkingSet || !device)return;
+    const char *configured=getenv("AGEPAD_GAME_GPU_BUDGET_MB");
+    if((!getenv("AGEPAD_BACKING_WORKING_SET")&&!configured) || DEOriginalWorkingSet || !device)return;
+    if(configured) {
+        char *end=NULL;errno=0;unsigned long long mb=strtoull(configured,&end,10);
+        if(errno || end==configured || *end || mb<128 || mb>16384)
+            DEUnsupported("game GPU budget must be 128 through 16384 MiB");
+        DEConfiguredGameWorkingSet=(uint64_t)mb*1024*1024;
+    }
     Class cls=object_getClass(device);
     SEL selector=@selector(recommendedMaxWorkingSetSize);
     Method method=class_getInstanceMethod(cls,selector);
@@ -157,7 +179,7 @@ static void DEInstallWorkingSet(id<MTLDevice> device) {
 }
 __attribute__((constructor)) static void DEInstallInitialWorkingSet(void) {
     // The game's machine survey precedes its device-observer registration.
-    if(getenv("AGEPAD_BACKING_WORKING_SET")) @autoreleasepool {
+    if(getenv("AGEPAD_BACKING_WORKING_SET") || getenv("AGEPAD_GAME_GPU_BUDGET_MB")) @autoreleasepool {
         DEInstallWorkingSet(MTLCreateSystemDefaultDevice());
     }
 }
@@ -213,7 +235,18 @@ static void DEInstallBuiltInAppleGPUQueries(id<MTLDevice> device,Class cls) {
     for(unsigned i=0;i<4;i++) missing|=!class_getInstanceMethod(cls,sel_registerName(flags[i]));
     for(unsigned i=0;i<2;i++) missing|=!class_getInstanceMethod(cls,sel_registerName(peers[i]));
     if(!missing)return;
-    if(!device.hasUnifiedMemory)DEUnsupported("macOS GPU topology for a non-unified-memory device");
+    BOOL unified=device.hasUnifiedMemory;
+#if TARGET_OS_SIMULATOR
+    // Simulator 27.1 can report a separate-memory model even on an Apple
+    // integrated GPU. The runner surveys native Metal before every launch.
+    // Use its exact-ID topology evidence, without changing hasUnifiedMemory
+    // or any allocation/feature limit seen by the engine or UIKit.
+    if(!unified && DEHostMetalUnifiedMemory(device.registryID)) {
+        unified=YES;
+        fprintf(stderr,"DE_METAL_BUILTIN_TOPOLOGY matched unified backing registry=%llu\n",device.registryID);
+    }
+#endif
+    if(!unified)DEUnsupported("macOS GPU topology for a non-unified-memory device");
     for(unsigned i=0;i<4;i++) {
         SEL selector=sel_registerName(flags[i]);
         if(!class_getInstanceMethod(cls,selector)&&!class_addMethod(cls,selector,(IMP)DEBuiltInAppleGPUNo,"B@:"))

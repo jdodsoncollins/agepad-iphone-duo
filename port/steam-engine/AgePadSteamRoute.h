@@ -5,6 +5,7 @@
 #include <mach/mach.h>
 
 typedef kern_return_t (*AgePadBootstrapLookUp)(mach_port_t,const char *,mach_port_t *);
+@class AgePadSteamContentClient;
 
 @interface AgePadSteamRoute : NSObject
 + (BOOL)hasAccount;
@@ -20,4 +21,8 @@ typedef kern_return_t (*AgePadBootstrapLookUp)(mach_port_t,const char *,mach_por
                  status:(void (^)(NSString *message))status completion:(void (^)(NSString *error))completion;
 // QR sign-in panel. signedIn runs on the main queue once the account is saved.
 + (UIView *)signInViewWithCompletion:(void (^)(void))signedIn;
+// Separately authorizes asset downloads. This does not launch the game or
+// expose the saved Steam token to the UI/download journal.
++ (void)prepareContentDownload:(AgePadSteamContentClient *)client profile:(NSDictionary *)profile
+    completion:(void (^)(NSDictionary *plan,NSError *error))completion progress:(void (^)(NSString *))progress;
 @end

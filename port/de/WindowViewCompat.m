@@ -5,9 +5,13 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
 #include "UnsupportedBoundary.h"
+#include "ExistingMethod.h"
 #include <dlfcn.h>
 #include "RenderScale.h"
+#include "WindowPresentation.h"
 #include "DrawablePresentationCompat.m"
+#include "TouchCommandWheelView.m"
+#include "HUDInputRegions.h"
 @class NSWindow, DEGameTrackingController;
 extern id DEUIKitScreenObject(UIScreen *screen);
 @protocol DEColorObject
@@ -25,16 +29,41 @@ extern id DEUIKitScreenObject(UIScreen *screen);
 @property(nonatomic,copy) NSString *characters,*charactersIgnoringModifiers;
 @property(nonatomic,getter=isARepeat) BOOL ARepeat;
 @end
+@interface DEPendingTouchClick : NSObject
+@property(nonatomic,strong) UITouch *touch;
+@property(nonatomic) CGPoint point;
+@property(nonatomic) BOOL secondary,cancelled,releaseQueued;
+@property(nonatomic,copy) NSString *HUDProfileIdentity;
+@end
+@implementation DEPendingTouchClick @end
 #include "OrderedMouseDelivery.h"
 @interface DEGameViewHost : UIView <UIGestureRecognizerDelegate>
 @property(nonatomic,strong) CALayer *gameLayer;
 @property(nonatomic,weak) id originalView;
 @property(nonatomic,strong) UITouch *gameTouch;
+@property(nonatomic,strong) NSMutableArray<DEPendingTouchClick *> *pendingClicks;
+@property(nonatomic,strong) DEPendingTouchClick *pendingClickContext;
+@property(nonatomic) BOOL pendingClickDelivery;
+@property(nonatomic,strong) NSHashTable<UITouch *> *HUDTouches;
+@property(nonatomic) BOOL gameTouchIsHUD,HUDInputConsumed;
+@property(nonatomic) CGRect HUDContactRegion;
+@property(nonatomic,copy) NSString *HUDContactIdentity,*lastInputHUDIdentity;
 @property(nonatomic) NSInteger gameClickCount;
 @property(nonatomic) UIEventButtonMask gameButtonMask;
 @property(nonatomic) CGPoint previousTouchPoint;
 @property(nonatomic,strong) UIButton *touchOrderButton;
 @property(nonatomic,strong) NSArray<UIButton *> *touchShortcutButtons;
+@property(nonatomic,strong) UIButton *commandWheelButton;
+@property(nonatomic,strong) UIButton *commandBackButton;
+@property(nonatomic) BOOL windowedPresentation;
+@property(nonatomic,strong) DETouchCommandWheelView *commandWheel;
+@property(nonatomic) BOOL wheelConsumed,wheelTouchDriven;
+@property(nonatomic) NSUInteger wheelGeneration;
+@property(nonatomic) CGPoint wheelAnchor;
+@property(nonatomic) CGRect lastInputBounds;
+@property(nonatomic) UIEdgeInsets lastInputInsets;
+@property(nonatomic,copy) NSArray<NSValue *> *lastInputReservedRects;
+@property(nonatomic,strong) NSTimer *reservedRegionTimer;
 @property(nonatomic) BOOL touchCommandMode;
 // Apple Pencil sticky orders (AGEPAD_PENCIL_STICKY_ORDER), gameplay only.
 @property(nonatomic) BOOL pencilPending,pendingIsPencil,pencilDragging,forceSecondary,overrideActive;
@@ -57,8 +86,23 @@ extern id DEUIKitScreenObject(UIScreen *screen);
 - (void)pencilDeselect:(const char *)how;
 - (void)nativeMapScrollPhase:(NSInteger)phase point:(CGPoint)point;
 - (void)nativeMouse:(NSUInteger)type point:(CGPoint)point wheel:(CGFloat)wheel;
+- (BOOL)usesCompactTouchControls;
+- (CGFloat)touchCoordinateScale;
+- (BOOL)canBeginTouchCommandWheel;
+- (void)beginTouchCommandWheel:(BOOL)touchDriven;
+- (void)updateTouchCommandWheel;
+- (void)performWheelAction:(DECommandWheelAction)action;
+- (void)cancelTouchCommandWheel;
+- (void)cancelHostInput:(NSNotification *)note;
+- (void)cancelNativeGestures;
+- (NSArray<NSValue *> *)HUDInputRegions;
+- (BOOL)pointInHUDInputRegion:(CGPoint)windowPoint;
+- (NSSet<UITouch *> *)hostTouches:(UIEvent *)event;
+- (BOOL)hostTouchesAllUp:(UIEvent *)event;
+- (BOOL)HUDContactIsValid;
 @end
 static void DEPostGameKey(unsigned short macKey, NSString *characters, BOOL pressed);
+static void DEGameHostDidLayout(DEGameViewHost *host);
 static BOOL DEGlobalTouchCommandMode;
 // Pencil: a tap or drag-box on the map selects and arms orders; further map
 // taps are right-click orders; a hold is a left click that disarms. HUD taps
@@ -99,7 +143,7 @@ static void DELogHostGeometry(NSString *phase, UIView *host) {
     if (!getenv("AGEPAD_HOST_GEOMETRY_TRACE") || !host) return;
     UIWindow *window=host.window;
     UIView *root=window.rootViewController.view;
-    UIScreen *screen=window.screen ?: UIScreen.mainScreen;
+    UIScreen *screen=window.windowScene.screen ?: window.screen;
     UIWindowScene *scene=window.windowScene;
     UIInterfaceOrientation orientation=scene ? scene.interfaceOrientation : UIInterfaceOrientationUnknown;
     fprintf(stderr,
@@ -147,12 +191,6 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
         [DETouchCommandHosts addObject:self];
         _touchOrderButton=[UIButton buttonWithType:UIButtonTypeSystem];
         [_touchOrderButton addTarget:self action:@selector(toggleTouchCommand:) forControlEvents:UIControlEventTouchUpInside];
-        [_touchOrderButton setTitleColor:[UIColor colorWithRed:0.16 green:0.09 blue:0.04 alpha:1.0] forState:UIControlStateNormal];
-        _touchOrderButton.backgroundColor=[UIColor colorWithRed:0.78 green:0.66 blue:0.46 alpha:0.96];
-        _touchOrderButton.layer.borderColor=[UIColor colorWithRed:0.37 green:0.20 blue:0.08 alpha:1.0].CGColor;
-        _touchOrderButton.layer.borderWidth=2.0;
-        _touchOrderButton.layer.cornerRadius=4.0;
-        _touchOrderButton.titleLabel.font=[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
         _touchOrderButton.accessibilityLabel=@"Right-click mode";
         [self addSubview:_touchOrderButton];
         NSMutableArray<UIButton *> *shortcuts=[NSMutableArray new];
@@ -169,7 +207,21 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
             [self addSubview:button];[shortcuts addObject:button];
         }
         self.touchShortcutButtons=shortcuts;
-        for(UIButton *button in [@[_touchOrderButton] arrayByAddingObjectsFromArray:shortcuts]) {
+        _commandWheelButton=[UIButton buttonWithType:UIButtonTypeSystem];
+        [_commandWheelButton setTitle:@"COMMANDS" forState:UIControlStateNormal];
+        [_commandWheelButton addTarget:self action:@selector(showTouchCommandWheel:) forControlEvents:UIControlEventTouchUpInside];
+        _commandWheelButton.accessibilityLabel=@"Game commands";
+        _commandWheelButton.accessibilityHint=@"Open commands. You can also hold the map, slide to a command, and release.";
+        _commandWheelButton.titleLabel.numberOfLines=2;
+        _commandWheelButton.titleLabel.textAlignment=NSTextAlignmentCenter;
+        [self addSubview:_commandWheelButton];
+        _commandBackButton=[UIButton buttonWithType:UIButtonTypeSystem];
+        [_commandBackButton setTitle:@"BACK" forState:UIControlStateNormal];
+        [_commandBackButton addTarget:self action:@selector(touchBack:) forControlEvents:UIControlEventTouchUpInside];
+        _commandBackButton.accessibilityLabel=@"Deselect or go back";
+        _commandBackButton.accessibilityHint=@"Cancel an order or selection, or close the game menu.";
+        [self addSubview:_commandBackButton];
+        for(UIButton *button in [@[_touchOrderButton,_commandWheelButton,_commandBackButton] arrayByAddingObjectsFromArray:shortcuts]) {
             [button setTitleColor:[UIColor colorWithRed:0.98 green:0.85 blue:0.56 alpha:1] forState:UIControlStateNormal];
             button.backgroundColor=[UIColor colorWithRed:0.38 green:0.055 blue:0.035 alpha:0.96];
             button.layer.borderColor=[UIColor colorWithRed:0.75 green:0.55 blue:0.23 alpha:1].CGColor;
@@ -184,6 +236,8 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
         shortcuts[4].accessibilityLabel=@"Game menu";
         [self refreshTouchCommandButton];
         [self installNativeGestures];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(cancelHostInput:) name:@"DEUIKitHostGeometryWillChange" object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(cancelHostInput:) name:UIApplicationWillResignActiveNotification object:nil];
         fprintf(stderr,"DE_TOUCH_COMMAND_OVERLAY installed style=gold-red-side-strip\n");
     }
     return self;
@@ -222,10 +276,18 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
     DEPostGameKey(key,characters,YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC),dispatch_get_main_queue(),^{DEPostGameKey(key,characters,NO);});
 }
+- (void)touchBack:(UIButton *)button {
+    [self cancelHostInput:nil];
+    // Reuse the guarded Escape path: an unguarded second Escape can open
+    // the game menu when the player only wanted to clear their selection.
+    [self pencilDeselect:"touch-back"];
+}
 - (BOOL)canBecomeFirstResponder { return YES; }
 - (void)refreshTouchCommandButton {
     if (!self.touchOrderButton) return;
     [self.touchOrderButton setTitle:DEGlobalTouchCommandMode?@"CANCEL":@"R-CLICK" forState:UIControlStateNormal];
+    [self.commandWheelButton setTitle:DEGlobalTouchCommandMode?@"CANCEL\nORDER":@"COMMANDS" forState:UIControlStateNormal];
+    self.commandWheelButton.accessibilityLabel=DEGlobalTouchCommandMode?@"Cancel right-click mode":@"Game commands";
 }
 - (void)toggleTouchCommand:(UIButton *)sender {
     DEGlobalTouchCommandMode=!DEGlobalTouchCommandMode;
@@ -240,7 +302,7 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
  SEL action=NSSelectorFromString(type==1?@"mouseDown:":type==2?@"mouseUp:":type==5?@"mouseMoved:":@"mouseDragged:");
  // UIKit clears buttonMask on release. Use the mask captured at touchesBegan
  // for the whole gesture, including drag and release, just like ORDER mode.
- BOOL secondary=(self.forceSecondary || DEGlobalTouchCommandMode || (self.gameButtonMask & UIEventButtonMaskSecondary)) && (type==1 || type==2 || type==6);
+ BOOL secondary=(self.pendingClickDelivery?self.forceSecondary:(self.forceSecondary || DEGlobalTouchCommandMode || (self.gameButtonMask & UIEventButtonMaskSecondary))) && (type==1 || type==2 || type==6);
  NSUInteger eventType=type==1?(secondary?3:1):type==2?(secondary?4:2):type==6?(secondary?7:6):type;
  id<DEGameMouseEvent> e=[NSClassFromString(@"NSEvent") new];
  CGPoint point=cancelled?CGPointMake(-100,-100):self.overrideActive?self.overridePoint:[touch locationInView:self.window];
@@ -257,13 +319,56 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
  if (secondary) fprintf(stderr,"DE_TOUCH_COMMAND_EVENT phase=%lu event_type=%lu button_number=%ld\n",(unsigned long)type,(unsigned long)eventType,(long)e.buttonNumber);
  if(verbose)fprintf(stderr,"DE_GAME_TOUCH type=%lu action=%s view=%s x=%g y=%g taps=%lu cancelled=%d\n",(unsigned long)type,sel_getName(action),object_getClassName(owner),point.x,point.y,(unsigned long)touch.tapCount,cancelled);
  id app=((id(*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSApplication"),sel_registerName("sharedApplication"));
+ DEPendingTouchClick *click=self.pendingClickContext;
+ CGPoint cancelledPoint=CGPointMake(-100,CGRectGetMaxY(contentHost.bounds)+100);
  void (^post)(void)=^{
+     // Ordered delivery may retain an event past the click's 60 ms timer.
+     // Recheck at posting, including a down queued behind an earlier click.
+     if(click.HUDProfileIdentity && ![click.HUDProfileIdentity isEqual:DEHUDInputRegionsIdentityForBounds(self.bounds)])click.cancelled=YES;
+     if(click.cancelled){e.locationInWindow=cancelledPoint;e.deltaX=0;e.deltaY=0;}
      ((void(*)(id,SEL,id,BOOL))objc_msgSend)(app,sel_registerName("postEvent:atStart:"),e,NO);
+     if(click && type==2)[self.pendingClicks removeObjectIdenticalTo:click];
      if(verbose)fprintf(stderr,"DE_GAME_TOUCH_ENQUEUED type=%lu\n",(unsigned long)type);
  };
  DEPostOrderedMouseEvent((id)e,self.gameLayer,post);
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+ if(!self.HUDTouches)self.HUDTouches=[NSHashTable weakObjectsHashTable];
+ for(UITouch *touch in touches) {
+     [self.HUDTouches removeObject:touch];
+     if([self pointInHUDInputRegion:[touch locationInView:self.window]])[self.HUDTouches addObject:touch];
+ }
+ NSSet<UITouch *> *hostTouches=[self hostTouches:event];
+ if(self.HUDInputConsumed) {
+     BOOL older=NO;for(UITouch *touch in hostTouches)
+         if(![touches containsObject:touch] && touch.phase!=UITouchPhaseEnded && touch.phase!=UITouchPhaseCancelled)older=YES;
+     if(older)return;self.HUDInputConsumed=NO;
+ }
+ NSUInteger activeCount=0;BOOL hasHUD=NO;UITouch *HUDTouch=nil;
+ for(UITouch *touch in hostTouches)if(touch.phase!=UITouchPhaseEnded && touch.phase!=UITouchPhaseCancelled) {
+     activeCount++;if([self.HUDTouches containsObject:touch]){hasHUD=YES;HUDTouch=touch;}
+ }
+ if(hasHUD && activeCount>1) {
+     [self cancelHostInput:nil];self.HUDInputConsumed=YES;return;
+ }
+ if(HUDTouch && !self.gameTouch) {
+     [self cancelNativeGestures];DEGlobalTouchCommandMode=NO;DEPencilOrderArmed=NO;DERefreshTouchCommandButtons();
+     self.gameTouch=HUDTouch;self.gameTouchIsHUD=YES;self.gameClickCount=1;self.gameButtonMask=0;
+     self.pencilPending=YES;self.pencilDragging=NO;self.pencilStart=[HUDTouch locationInView:self.window];
+     self.HUDContactIdentity=DEHUDInputRegionsIdentityForBounds(self.bounds);
+     CGPoint local=[self convertPoint:self.pencilStart fromView:self.window];
+     for(NSValue *region in [self HUDInputRegions])if(CGRectContainsPoint(region.CGRectValue,local)){self.HUDContactRegion=region.CGRectValue;break;}
+     [self sendGameMouse:5 touch:HUDTouch cancelled:NO];return;
+ }
+ if(self.commandWheel || self.wheelConsumed) {
+     // A second contact cancels a held wheel. Consume the remaining sequence;
+     // a genuinely new sequence after a system cancellation can start normally.
+     BOOL older=NO;
+     for(UITouch *touch in [self mapTouches:event])
+         if(![touches containsObject:touch] && touch.phase!=UITouchPhaseEnded && touch.phase!=UITouchPhaseCancelled)older=YES;
+     if(self.commandWheel || older){[self cancelTouchCommandWheel];self.wheelConsumed=YES;return;}
+     self.wheelConsumed=NO;
+ }
  // Second finger on the map soon after the first (and neither a Pencil): a
  // two-finger tap candidate. Undo anything the first finger started.
  // Only touches on the game view count: a finger holding a side button
@@ -295,8 +400,9 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
  self.gameButtonMask=event.buttonMask;DELogButtonMask(event,1,self.gameButtonMask);
  self.pencilPending=NO;self.pencilDragging=NO;
  BOOL pencil=self.gameTouch.type==UITouchTypePencil;
+ BOOL wheelCandidate=self.gameTouch.type==UITouchTypeDirect && event.buttonMask==0 && [self canBeginTouchCommandWheel];
  BOOL defer=!DEGlobalTouchCommandMode && DEPencilMatchActive() &&
-     ((pencil && getenv("AGEPAD_PENCIL_STICKY_ORDER")) || (!pencil && getenv("AGEPAD_TOUCH_DEFER_PRESS")));
+     ((pencil && getenv("AGEPAD_PENCIL_STICKY_ORDER")) || (!pencil && (getenv("AGEPAD_TOUCH_DEFER_PRESS") || wheelCandidate)));
  if(defer) {
      // In a match, decide the button when the gesture resolves. Fingers wait
      // briefly so a second finger (two-finger order tap) never leaves a stray
@@ -306,11 +412,17 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
      [self sendGameMouse:5 touch:self.gameTouch cancelled:NO];
      if(!pencil) {
          UITouch *touch=self.gameTouch;
+         NSUInteger generation=++self.wheelGeneration;
          // DETwoFingerWindow covers the gap between the two fingers of an
          // order tap, even a slow one, so the first finger is cancelled
          // instead of clicking (deselecting). Moving starts a drag at once.
-         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(DETwoFingerWindow*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
-             if(self.pencilPending && self.gameTouch==touch){[self commitPendingPress];fprintf(stderr,"DE_TOUCH_DEFERRED_PRESS reason=held\n");}
+         NSTimeInterval delay=wheelCandidate?DECommandWheelHoldDuration:DETwoFingerWindow;
+         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+             if(self.pencilPending && self.gameTouch==touch && self.wheelGeneration==generation) {
+                 if(wheelCandidate && [self canBeginTouchCommandWheel] && ![self pencilPointInHUD:self.pencilStart])
+                     [self beginTouchCommandWheel:YES];
+                 else {[self commitPendingPress];fprintf(stderr,"DE_TOUCH_DEFERRED_PRESS reason=held\n");}
+             }
          });
      }
      return;
@@ -322,8 +434,18 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
 }
 // Touches on the game view itself (not on the side buttons).
 - (NSSet<UITouch *> *)mapTouches:(UIEvent *)event {
+ return [[self hostTouches:event] objectsPassingTest:^BOOL(UITouch *t,BOOL *stop){return ![self.HUDTouches containsObject:t];}];
+}
+- (NSSet<UITouch *> *)hostTouches:(UIEvent *)event {
  return [event.allTouches objectsPassingTest:^BOOL(UITouch *t,BOOL *stop){
-     return t.view && [t.view isDescendantOfView:self] && ![t.view isKindOfClass:UIControl.class]; }];
+     if(!t.view || ![t.view isDescendantOfView:self])return NO;
+     for(UIView *view=t.view;view && view!=self;view=view.superview)
+         if([view isKindOfClass:UIControl.class])return NO;
+     return YES; }];
+}
+- (BOOL)hostTouchesAllUp:(UIEvent *)event {
+ for(UITouch *touch in [self hostTouches:event])if(touch.phase!=UITouchPhaseEnded && touch.phase!=UITouchPhaseCancelled)return NO;
+ return YES;
 }
 - (BOOL)mapTouchesAllUp:(UIEvent *)event {
  for(UITouch *t in [self mapTouches:event])if(t.phase!=UITouchPhaseEnded && t.phase!=UITouchPhaseCancelled)return NO;
@@ -332,6 +454,7 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
 // Left button down at the original contact point; the gesture continues as a
 // normal press/drag (selection box) and releases in touchesEnded.
 - (void)commitPendingPress {
+ self.wheelGeneration++;
  self.pencilPending=NO;self.pencilDragging=YES;self.gameClickCount=1;
  self.overrideActive=YES;self.overridePoint=self.pencilStart;
  [self sendGameMouse:5 touch:self.gameTouch cancelled:NO];[self sendGameMouse:1 touch:self.gameTouch cancelled:NO];
@@ -340,20 +463,53 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
 // A complete single click at the original contact point with a real ~60 ms
 // press. A same-instant down/up pair (or tapCount>1 double-clicks from quick
 // repeated taps) was not handled as a plain click by the engine.
+- (void)deliverPendingClick:(DEPendingTouchClick *)click type:(NSUInteger)type cancelled:(BOOL)cancelled {
+ BOOL override=self.overrideActive,secondary=self.forceSecondary,delivery=self.pendingClickDelivery;
+ DEPendingTouchClick *context=self.pendingClickContext;
+ CGPoint point=self.overridePoint;NSInteger count=self.gameClickCount;
+ self.gameClickCount=1;self.overrideActive=YES;self.overridePoint=click.point;
+ self.forceSecondary=click.secondary;self.pendingClickDelivery=YES;self.pendingClickContext=click;
+ [self sendGameMouse:type touch:click.touch cancelled:cancelled];
+ self.gameClickCount=count;self.overrideActive=override;self.overridePoint=point;
+ self.forceSecondary=secondary;self.pendingClickDelivery=delivery;self.pendingClickContext=context;
+}
+- (void)finishPendingClick:(DEPendingTouchClick *)click cancelled:(BOOL)cancelled {
+ NSUInteger index=[self.pendingClicks indexOfObjectIdenticalTo:click];
+ if(index==NSNotFound)return;
+ if(cancelled)click.cancelled=YES;
+ // Keep the token until its up actually posts. Cancellation can then relocate
+ // that same queued up, even after the timer has handed it to ordered delivery.
+ if(click.releaseQueued)return;
+ click.releaseQueued=YES;
+ if(cancelled)[self deliverPendingClick:click type:6 cancelled:YES];
+ [self deliverPendingClick:click type:2 cancelled:cancelled];
+}
 - (void)sendPendingClick:(BOOL)secondary {
  UITouch *touch=self.gameTouch;CGPoint point=self.pencilStart;
+ if(!touch)return;
+ // Keep each pair independently: another quick tap may arrive before its up.
+ DEPendingTouchClick *click=[DEPendingTouchClick new];click.touch=touch;click.point=point;click.secondary=secondary;
+ if(self.gameTouchIsHUD)click.HUDProfileIdentity=self.HUDContactIdentity;
+ if(!self.pendingClicks)self.pendingClicks=[NSMutableArray new];
+ [self.pendingClicks addObject:click];
  extern void DEUIKitPinPointer(CGPoint windowPoint,NSTimeInterval seconds);
  DEUIKitPinPointer(point,0.25);
- self.gameClickCount=1;self.overrideActive=YES;self.overridePoint=point;self.forceSecondary=secondary;
- [self sendGameMouse:5 touch:touch cancelled:NO];[self sendGameMouse:1 touch:touch cancelled:NO];
- self.overrideActive=NO;self.forceSecondary=NO;
+ [self deliverPendingClick:click type:5 cancelled:NO];[self deliverPendingClick:click type:1 cancelled:NO];
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,60*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
-     self.gameClickCount=1;self.overrideActive=YES;self.overridePoint=point;self.forceSecondary=secondary;
-     [self sendGameMouse:2 touch:touch cancelled:NO];
-     self.overrideActive=NO;self.forceSecondary=NO;
+     [self finishPendingClick:click cancelled:NO];
  });
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+ if(self.HUDInputConsumed)return;
+ if(self.gameTouchIsHUD) {
+     if(![self HUDContactIsValid])[self cancelHostInput:nil];
+     return;
+ }
+ if(self.wheelConsumed) {
+     if(self.commandWheel && self.wheelTouchDriven && [touches containsObject:self.gameTouch])
+         [self updateTouchCommandWheel];
+     return;
+ }
  if(self.twoFingerCandidate) {
      // A pinch or scroll moves the fingers; a tap barely does.
      for(UITouch *t in touches){NSValue *s=self.twoFingerStarts[[NSValue valueWithNonretainedObject:t]];
@@ -377,6 +533,22 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
  [self sendGameMouse:6 touch:self.gameTouch cancelled:NO];
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+ if(self.HUDInputConsumed){if([self hostTouchesAllUp:event]){self.HUDInputConsumed=NO;self.wheelConsumed=NO;}return;}
+ if(self.gameTouchIsHUD) {
+     if(![touches containsObject:self.gameTouch])return;
+     if([self HUDContactIsValid])[self sendPendingClick:NO];else [self cancelHostInput:nil];
+     self.gameTouch=nil;self.gameTouchIsHUD=NO;self.pencilPending=NO;self.HUDContactIdentity=nil;
+     if([self hostTouchesAllUp:event]){self.HUDInputConsumed=NO;self.wheelConsumed=NO;}
+     return;
+ }
+ if(self.wheelConsumed) {
+     if(self.commandWheel && self.wheelTouchDriven && [touches containsObject:self.gameTouch]) {
+         [self updateTouchCommandWheel];
+         [self performWheelAction:self.commandWheel.selectedAction];
+     }
+     if([self mapTouchesAllUp:event])self.wheelConsumed=NO;
+     return;
+ }
  if(self.twoFingerCandidate) {
      if(![self mapTouchesAllUp:event])return;
      NSTimeInterval held=event.timestamp-self.twoFingerStart;
@@ -427,6 +599,15 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
      [self sendGameMouse:2 touch:self.gameTouch cancelled:NO];self.gameTouch=nil;if(DEGlobalTouchCommandMode){DEGlobalTouchCommandMode=NO;DERefreshTouchCommandButtons();fprintf(stderr,"DE_TOUCH_COMMAND_MODE mode=select reason=target-complete\n");}}
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+ if(self.gameTouchIsHUD || self.HUDInputConsumed) {
+     [self cancelHostInput:nil];if([self hostTouchesAllUp:event]){self.HUDInputConsumed=NO;self.wheelConsumed=NO;}return;
+ }
+ self.wheelGeneration++;
+ if(self.wheelConsumed || self.commandWheel) {
+     [self cancelTouchCommandWheel];
+     if([self mapTouchesAllUp:event])self.wheelConsumed=NO;
+     return;
+ }
  if(self.twoFingerCandidate){ // a pinch or map scroll took over
      if([self mapTouchesAllUp:event]){self.twoFingerCandidate=NO;self.twoFingerStarts=nil;}
      return;
@@ -442,25 +623,257 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
 - (BOOL)pencilPointInHUD:(CGPoint)windowPoint {
     // DE's top resource bar and bottom command panel/minimap bands.
     CGPoint local=[self convertPoint:windowPoint fromView:self.window];CGFloat h=self.bounds.size.height;
-    return local.y<h*0.05 || local.y>h*0.83;
+    return [self pointInHUDInputRegion:windowPoint] || local.y<h*0.05 || local.y>h*0.83;
 }
+- (NSArray<NSValue *> *)HUDInputRegions { return DEHUDInputRegionsForBounds(self.bounds); }
+- (BOOL)pointInHUDInputRegion:(CGPoint)windowPoint {
+    CGPoint local=[self convertPoint:windowPoint fromView:self.window];
+    for(NSValue *region in [self HUDInputRegions])if(CGRectContainsPoint(region.CGRectValue,local))return YES;
+    return NO;
+}
+- (BOOL)HUDContactIsValid {
+    CGPoint point=[self.gameTouch locationInView:self.window],local=[self convertPoint:point fromView:self.window];
+    return self.HUDContactIdentity && [self.HUDContactIdentity isEqual:DEHUDInputRegionsIdentityForBounds(self.bounds)] &&
+        CGRectContainsPoint(self.HUDContactRegion,local) && hypot(point.x-self.pencilStart.x,point.y-self.pencilStart.y)<=8;
+}
+- (NSArray<NSValue *> *)activeTouchReservedRects {
+    NSMutableArray<NSValue *> *rects=[NSMutableArray new];
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270100
+    if (@available(iOS 27.1,*)) {
+        for (UIViewReservedRegionKind *kind in @[UIViewReservedRegionKind.divisionRegionKind,UIViewReservedRegionKind.occlusionRegionKind])
+            for (UIViewReservedRegion *region in [self reservedRegionsOfKind:kind options:UIViewReservedRegionQueryOptionsNone]) {
+                CGRect frame=CGRectIntersection(self.bounds,region.frame);
+                if (region.isActive && !CGRectIsEmpty(frame) && !CGRectIsNull(frame)) {
+                    NSValue *value=[NSValue valueWithCGRect:frame];
+                    if (![rects containsObject:value]) [rects addObject:value];
+                }
+            }
+    }
+#endif
+    // Query enumeration order is not a geometry change.
+    [rects sortUsingComparator:^NSComparisonResult(NSValue *a,NSValue *b) {
+        CGRect x=a.CGRectValue,y=b.CGRectValue;
+        CGFloat av[]={x.origin.x,x.origin.y,x.size.width,x.size.height};
+        CGFloat bv[]={y.origin.x,y.origin.y,y.size.width,y.size.height};
+        for (NSUInteger i=0;i<4;i++) { if(av[i]<bv[i])return NSOrderedAscending;if(av[i]>bv[i])return NSOrderedDescending; }
+        return NSOrderedSame;
+    }];
+    return rects;
+}
+- (NSArray<NSValue *> *)touchControlRegions {
+    CGFloat scale=[self touchCoordinateScale];
+    CGRect safe=CGRectInset(UIEdgeInsetsInsetRect(self.bounds,self.safeAreaInsets),8*scale,8*scale);
+    return DEClearControlRects(safe,[[self activeTouchReservedRects] arrayByAddingObjectsFromArray:[self HUDInputRegions]]);
+}
+- (CGRect)wheelRegionNearPoint:(CGPoint)point {
+    CGFloat diameter=(2*DECommandWheelMinimumRadius+24)*[self touchCoordinateScale];
+    return DEControlRegionNearPoint([self touchControlRegions],CGSizeMake(diameter,diameter),point);
+}
+- (BOOL)usesCompactTouchControls {
+    CGRect safe=UIEdgeInsetsInsetRect(self.bounds,self.safeAreaInsets);
+    CGFloat scale=[self touchCoordinateScale];
+    CGRect strip=DEControlRegionNearPoint([self touchControlRegions],CGSizeMake(76*scale,356*scale),CGPointMake(CGRectGetMaxX(safe),CGRectGetMidY(safe)));
+    return DEUseCompactControls(safe.size.width/scale,safe.size.height/scale) || CGRectIsNull(strip);
+}
+- (CGFloat)touchCoordinateScale {
+    CGSize viewport=self.window.rootViewController.view.bounds.size;
+    return 1/DEGameCanvasFit(viewport);
+}
+- (BOOL)canBeginTouchCommandWheel {
+    return self.commandWheelButton && [self usesCompactTouchControls] && DEPencilMatchActive() && !DEMenuOpen &&
+           !CGRectIsNull([self wheelRegionNearPoint:[self convertPoint:self.pencilStart fromView:self.window]]);
+}
+- (void)showTouchCommandWheel:(UIButton *)sender {
+    if(self.commandWheel){[self cancelTouchCommandWheel];return;}
+    if(DEGlobalTouchCommandMode){DEGlobalTouchCommandMode=NO;DERefreshTouchCommandButtons();return;}
+    // Accessible alternative to a timed gesture; ORDER arms the next map tap.
+    [self cancelHostInput:nil];
+    [self beginTouchCommandWheel:NO];
+}
+- (void)beginTouchCommandWheel:(BOOL)touchDriven {
+    CGPoint point=touchDriven?[self convertPoint:self.pencilStart fromView:self.window]:self.commandWheelButton.center;
+    CGRect safe=[self wheelRegionNearPoint:point];
+    if(CGRectIsNull(safe)) {
+        if (!touchDriven) {
+            // System presentations adapt when a tiny split window cannot fit
+            // a radial wheel. Every command remains reachable from COMMANDS.
+            UIAlertController *menu=[UIAlertController alertControllerWithTitle:@"Game commands" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+            NSArray *titles=@[@"Order on next map tap",@"Select idle villager",@"Select town center",@"Zoom in",@"Zoom out",@"Game menu"];
+            __weak DEGameViewHost *weakSelf=self;
+            for(NSInteger i=0;i<DECommandWheelActionCount;i++)
+                [menu addAction:[UIAlertAction actionWithTitle:titles[i] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){[weakSelf performWheelAction:(DECommandWheelAction)i];}]];
+            [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            menu.popoverPresentationController.sourceView=self.commandWheelButton;
+            menu.popoverPresentationController.sourceRect=self.commandWheelButton.bounds;
+            UIViewController *presenter=self.window.rootViewController;
+            while(presenter.presentedViewController)presenter=presenter.presentedViewController;
+            [presenter presentViewController:menu animated:YES completion:nil];
+        }
+        return;
+    }
+    self.wheelGeneration++;self.pencilPending=NO;self.pencilDragging=NO;
+    self.wheelTouchDriven=touchDriven;self.wheelAnchor=self.pencilStart;
+    self.wheelConsumed=self.wheelConsumed || touchDriven;
+    CGFloat coordinateScale=[self touchCoordinateScale];
+    CGRect wheelBounds=CGRectMake(0,0,self.bounds.size.width/coordinateScale,self.bounds.size.height/coordinateScale);
+    DETouchCommandWheelView *wheel=[[DETouchCommandWheelView alloc] initWithFrame:wheelBounds];
+    wheel.transform=CGAffineTransformMakeScale(coordinateScale,coordinateScale);
+    wheel.center=CGPointMake(CGRectGetMidX(self.bounds),CGRectGetMidY(self.bounds));
+    self.commandWheel=wheel;wheel.userInteractionEnabled=!touchDriven;
+    [wheel placeAtPoint:CGPointMake(point.x/coordinateScale,point.y/coordinateScale)
+              safeRect:CGRectMake(safe.origin.x/coordinateScale,safe.origin.y/coordinateScale,safe.size.width/coordinateScale,safe.size.height/coordinateScale)];
+    if(!touchDriven)wheel.actionButtons[DECommandWheelOrder].accessibilityLabel=@"Order on next map tap";
+    __weak DEGameViewHost *weakSelf=self;
+    wheel.actionHandler=^(DECommandWheelAction action){[weakSelf performWheelAction:action];};
+    [self addSubview:wheel];
+    if(touchDriven) {
+        UISelectionFeedbackGenerator *feedback=[UISelectionFeedbackGenerator new];[feedback selectionChanged];
+    } else UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification,wheel.actionButtons.firstObject);
+    fprintf(stderr,"DE_COMMAND_WHEEL opened source=%s\n",touchDriven?"hold":"button");
+}
+- (void)updateTouchCommandWheel {
+    // Clamping the drawing must not turn a stationary hold at a screen edge
+    // into a command. Choose by displacement from the original contact.
+    CGPoint start=[self convertPoint:self.wheelAnchor fromView:self.window];
+    CGPoint point=[self.gameTouch locationInView:self];
+    CGFloat scale=[self touchCoordinateScale];
+    [self.commandWheel trackPoint:CGPointMake(self.commandWheel.wheelCenter.x+(point.x-start.x)/scale,
+                                              self.commandWheel.wheelCenter.y+(point.y-start.y)/scale)];
+}
+- (void)cancelTouchCommandWheel {
+    self.wheelGeneration++;
+    BOOL wasOpen=self.commandWheel!=nil;
+    [self.commandWheel removeFromSuperview];self.commandWheel=nil;
+    if(self.wheelTouchDriven){self.gameTouch=nil;self.pencilPending=NO;self.pencilDragging=NO;}
+    self.wheelTouchDriven=NO;
+    if(wasOpen)fprintf(stderr,"DE_COMMAND_WHEEL closed\n");
+}
+- (void)performWheelAction:(DECommandWheelAction)action {
+    if(self.commandWheel && self.lastInputReservedRects && ![self.lastInputReservedRects isEqualToArray:[self activeTouchReservedRects]]) {
+        [self cancelHostInput:nil];[self setNeedsLayout];return;
+    }
+    BOOL held=self.wheelTouchDriven;UITouch *touch=self.gameTouch;CGPoint anchor=self.wheelAnchor;
+    [self cancelTouchCommandWheel];
+    if(action==DECommandWheelNone)return;
+    if(action==DECommandWheelOrder) {
+        if(held && touch) {
+            DEMenuOpen=NO;self.gameTouch=touch;self.pencilStart=anchor;
+            [self sendPendingClick:YES];self.gameTouch=nil;
+            DEGlobalTouchCommandMode=NO;
+        } else DEGlobalTouchCommandMode=YES;
+        DERefreshTouchCommandButtons();
+    } else if(action==DECommandWheelZoomIn || action==DECommandWheelZoomOut) {
+        [self nativeMouse:22 point:CGPointMake(CGRectGetMidX(self.bounds),CGRectGetMidY(self.bounds)) wheel:action==DECommandWheelZoomIn?1:-1];
+    } else {
+        NSUInteger index=action==DECommandWheelIdle?0:action==DECommandWheelTown?1:4;
+        [self touchShortcut:self.touchShortcutButtons[index]];
+    }
+    fprintf(stderr,"DE_COMMAND_WHEEL action=%ld source=%s\n",(long)action,held?"hold":"button");
+}
+- (void)cancelHostInput:(NSNotification *)note {
+    if([note.object isKindOfClass:UIWindow.class] && note.object!=self.window)return;
+    self.wheelGeneration++;
+    self.HUDInputConsumed=self.HUDInputConsumed || self.gameTouchIsHUD;
+    for(DEPendingTouchClick *click in [self.pendingClicks copy])[self finishPendingClick:click cancelled:YES];
+    if(self.gameTouch || self.commandWheel) {
+        if(!self.gameTouchIsHUD)self.wheelConsumed=self.gameTouch!=nil || self.wheelConsumed;
+        if(self.commandWheel)[self cancelTouchCommandWheel];
+        else if(self.gameTouch && !self.pencilPending) {
+            [self sendGameMouse:6 touch:self.gameTouch cancelled:YES];
+            [self sendGameMouse:2 touch:self.gameTouch cancelled:YES];
+        }
+    }
+    self.gameTouch=nil;self.pencilPending=NO;self.pencilDragging=NO;
+    self.gameTouchIsHUD=NO;self.HUDContactIdentity=nil;
+    self.twoFingerCandidate=NO;self.twoFingerStarts=nil;
+    [self.zoomTimer invalidate];self.zoomTimer=nil;
+    DEGlobalTouchCommandMode=NO;DERefreshTouchCommandButtons();
+    [self cancelNativeGestures];
+}
+- (void)willMoveToWindow:(UIWindow *)newWindow {
+    if(self.window && self.window!=newWindow)[self cancelHostInput:nil];
+    [super willMoveToWindow:newWindow];
+}
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self.reservedRegionTimer invalidate];self.reservedRegionTimer=nil;
+    BOOL monitor=getenv("AGEPAD_HUD_INPUT_REGIONS")!=NULL;
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270100
+    if (@available(iOS 27.1,*))monitor=YES;
+#endif
+    if(monitor && self.window && self.commandWheelButton) {
+        // UIKit exposes a query but no public reserved-region change callback.
+        // Poll only attached overlays; camera activation need not resize them.
+        __weak DEGameViewHost *weakSelf=self;
+        self.reservedRegionTimer=[NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+            DEGameViewHost *host=weakSelf;
+            if(!host || !host.window){[timer invalidate];return;}
+            NSString *HUDIdentity=DEHUDInputRegionsIdentityForBounds(host.bounds);
+            if(![host.lastInputReservedRects isEqualToArray:[host activeTouchReservedRects]] ||
+               ![(host.lastInputHUDIdentity?:@"") isEqual:(HUDIdentity?:@"")]) {
+                [host cancelHostInput:nil];[host setNeedsLayout];
+            }
+        }];
+        [NSRunLoop.mainRunLoop addTimer:self.reservedRegionTimer forMode:NSRunLoopCommonModes];
+    }
+}
+- (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange];[self setNeedsLayout]; }
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self];[self.zoomTimer invalidate];[self.reservedRegionTimer invalidate]; }
 - (void)layoutSubviews {
     [super layoutSubviews];
+    NSArray<NSValue *> *reserved=[self activeTouchReservedRects];
+    NSString *HUDIdentity=DEHUDInputRegionsIdentityForBounds(self.bounds);
+    if(!CGRectIsEmpty(self.lastInputBounds) && (!CGRectEqualToRect(self.lastInputBounds,self.bounds) || !UIEdgeInsetsEqualToEdgeInsets(self.lastInputInsets,self.safeAreaInsets) || ![self.lastInputReservedRects isEqualToArray:reserved] || ![(self.lastInputHUDIdentity?:@"") isEqual:(HUDIdentity?:@"")]))
+        [self cancelHostInput:nil];
+    self.lastInputBounds=self.bounds;self.lastInputInsets=self.safeAreaInsets;self.lastInputReservedRects=reserved;
+    self.lastInputHUDIdentity=HUDIdentity;
     if (self.gameLayer) {
         [CATransaction begin];[CATransaction setDisableActions:YES];
-        self.gameLayer.frame=self.bounds;self.gameLayer.contentsScale=DERenderScale(self.window.screen);
+        self.gameLayer.frame=self.bounds;self.gameLayer.contentsScale=DERenderScaleForView(self);
         [CATransaction commit];
     }
+    DEGameHostDidLayout(self);
     if (self.touchOrderButton) {
-        // Thumb strip stays above the minimap and outside the bottom command HUD.
-        CGFloat width=76,height=44,gap=8;
-        CGFloat x=CGRectGetMaxX(self.bounds)-self.safeAreaInsets.right-width-12;
-        CGFloat y=CGRectGetMidY(self.bounds)-(6*height+5*gap)/2;
+        CGFloat coordinateScale=[self touchCoordinateScale];
+        CGRect safe=UIEdgeInsetsInsetRect(self.bounds,self.safeAreaInsets);
+        BOOL compact=[self usesCompactTouchControls];
+        NSArray<NSValue *> *regions=[self touchControlRegions];
+        CGPoint preferred=CGPointMake(CGRectGetMaxX(safe)-62*coordinateScale,CGRectGetMidY(safe));
+        CGRect entry=DEControlRegionNearPoint(regions,CGSizeMake(108*coordinateScale,96*coordinateScale),preferred);
+        self.commandWheelButton.hidden=self.windowedPresentation || !compact || CGRectIsNull(entry);
+        self.commandBackButton.hidden=self.windowedPresentation || CGRectIsNull(entry);
+        if(!CGRectIsNull(entry)) {
+            CGFloat y=MAX(CGRectGetMinY(entry),MIN(CGRectGetMaxY(entry)-96*coordinateScale,preferred.y-48*coordinateScale));
+            self.commandWheelButton.transform=CGAffineTransformIdentity;
+            self.commandWheelButton.bounds=CGRectMake(0,0,108,44);
+            self.commandWheelButton.center=CGPointMake(CGRectGetMaxX(entry)-54*coordinateScale,y+22*coordinateScale);
+            self.commandWheelButton.transform=CGAffineTransformMakeScale(coordinateScale,coordinateScale);
+            self.commandBackButton.transform=CGAffineTransformIdentity;
+            self.commandBackButton.bounds=CGRectMake(0,0,76,44);
+            self.commandBackButton.center=CGPointMake(CGRectGetMaxX(entry)-38*coordinateScale,y+74*coordinateScale);
+            self.commandBackButton.transform=CGAffineTransformMakeScale(coordinateScale,coordinateScale);
+        }
+        // Larger windows retain the original six-button strip. Compact windows
+        // expose the same actions through a single thumb-sized entry point.
+        CGFloat width=76*coordinateScale,height=44*coordinateScale,gap=8*coordinateScale;
+        CGRect strip=DEControlRegionNearPoint(regions,CGSizeMake(width,7*height+6*gap),preferred);
+        CGFloat x=0,y=0;
+        if(!CGRectIsNull(strip)) {
+            x=CGRectGetMaxX(strip)-width;
+            y=MAX(CGRectGetMinY(strip),MIN(CGRectGetMaxY(strip)-(7*height+6*gap),preferred.y-(7*height+6*gap)/2));
+        }
         NSArray *buttons=[@[self.touchOrderButton] arrayByAddingObjectsFromArray:self.touchShortcutButtons];
+        if(self.commandBackButton && !compact)buttons=[buttons arrayByAddingObject:self.commandBackButton];
         for(NSUInteger i=0;i<buttons.count;i++) {
-            UIButton *button=buttons[i];button.frame=CGRectMake(x,y+i*(height+gap),width,height);
+            UIButton *button=buttons[i];button.transform=CGAffineTransformIdentity;
+            button.bounds=CGRectMake(0,0,76,44);button.center=CGPointMake(x+width/2,y+i*(height+gap)+height/2);
+            button.transform=CGAffineTransformMakeScale(coordinateScale,coordinateScale);
+            button.hidden=self.windowedPresentation || compact || CGRectIsNull(strip);
             [self bringSubviewToFront:button];
         }
+        [self bringSubviewToFront:self.commandWheelButton];
+        if(self.commandBackButton)[self bringSubviewToFront:self.commandBackButton];
+        if(self.commandWheel)[self bringSubviewToFront:self.commandWheel];
     }
 }
 @end
@@ -481,7 +894,13 @@ static void DELogSynthesizedMouse(NSUInteger phase, id<DEGameMouseEvent> event, 
 - (CALayer *)layer;
 - (void)resetCursorRects;
 @end
+#ifndef AGEPAD_PUBLIC_API
+#define AGEPAD_PUBLIC_API 0
+#endif
+#include "TrackingTypes.h"
+#if !AGEPAD_PUBLIC_API
 #include "LegacyWebViewHost.m"
+#endif
 @interface DEGameTrackingController : NSObject
 @property(nonatomic,weak) UIView *host;
 @property(nonatomic,strong) NSMutableArray<DEWebTrackingRecord *> *records;
@@ -514,8 +933,10 @@ static UIView *DEHostView(id view) {
     if (!view) return nil;
     if ([view isKindOfClass:UIView.class]) return view;
     if ([view isKindOfClass:NSView.class]) return ((NSView *)view).deHost;
+#if !AGEPAD_PUBLIC_API
     Class wak=NSClassFromString(@"WAKView");
     if (wak && [view isKindOfClass:wak]) return DELegacyHost(view);
+#endif
     DEUnsupported("unsupported view host object");
 }
 static void DEUIKitWantsLayer(id view,SEL selector,BOOL wants) {
@@ -525,25 +946,28 @@ static void DEUIKitWantsLayer(id view,SEL selector,BOOL wants) {
 void DEInstallNativeViewCompatibility(void) {
     Class cls=NSClassFromString(@"CFeralNSWebView");
     fprintf(stderr,"DE_NATIVE_VIEW_CLASS present=%d parent=%s uiview=%d\n",cls!=Nil,cls?class_getName(class_getSuperclass(cls)):"none",cls?[cls isSubclassOfClass:UIView.class]:0);
+#if !AGEPAD_PUBLIC_API
     Class wak=NSClassFromString(@"WAKView");
-    if (cls && wak && [cls isSubclassOfClass:wak] && !class_getInstanceMethod(cls,@selector(setWantsLayer:)))
+    if (cls && wak && [cls isSubclassOfClass:wak] && !DEExistingInstanceMethod(cls,@selector(setWantsLayer:)))
         class_addMethod(cls,@selector(setWantsLayer:),(IMP)DEWAKWantsLayer,"v@:B");
     if (cls && wak && [cls isSubclassOfClass:wak]) {
-        if (!class_getInstanceMethod(cls,@selector(addTrackingArea:))) class_addMethod(cls,@selector(addTrackingArea:),(IMP)DEWAKAddTracking,"v@:@");
-        if (!class_getInstanceMethod(cls,@selector(removeTrackingArea:))) class_addMethod(cls,@selector(removeTrackingArea:),(IMP)DEWAKRemoveTracking,"v@:@");
+        if (!DEExistingInstanceMethod(cls,@selector(addTrackingArea:))) class_addMethod(cls,@selector(addTrackingArea:),(IMP)DEWAKAddTracking,"v@:@");
+        if (!DEExistingInstanceMethod(cls,@selector(removeTrackingArea:))) class_addMethod(cls,@selector(removeTrackingArea:),(IMP)DEWAKRemoveTracking,"v@:@");
         if (!DEOriginalWebSetFrame) {
-            Method method=class_getInstanceMethod(cls,@selector(setFrame:));
+            Method method=DEExistingInstanceMethod(cls,@selector(setFrame:));
             if (!method) DEUnsupported("legacy web frame setter unavailable");
             DEOriginalWebSetFrame=method_getImplementation(method);
             class_replaceMethod(cls,@selector(setFrame:),(IMP)DEWAKSetFrame,method_getTypeEncoding(method));
         }
     }
-    if (cls && [cls isSubclassOfClass:UIView.class] && !class_getInstanceMethod(cls,@selector(setWantsLayer:)))
+#endif
+    if (cls && [cls isSubclassOfClass:UIView.class] && !DEExistingInstanceMethod(cls,@selector(setWantsLayer:)))
         class_addMethod(cls,@selector(setWantsLayer:),(IMP)DEUIKitWantsLayer,"v@:B");
 }
 @interface NSWindow : UIResponder
 @property(nonatomic,weak) id delegate;
 @property(nonatomic,strong) NSView *contentView;
+@property(nonatomic,strong) UIView *dePresentation;
 @property(nonatomic,weak) UIWindow *deUIKitWindow;
 @property(nonatomic,copy) NSString *title;
 @property(nonatomic) NSUInteger styleMask;
@@ -555,12 +979,18 @@ void DEInstallNativeViewCompatibility(void) {
 @property(nonatomic) BOOL deVisible;
 @property(nonatomic) CGRect deWindowedFrame;
 @property(nonatomic) BOOL deFullScreenTransition;
+@property(nonatomic) CGFloat deReportedBackingScale;
+@property(nonatomic,strong) UIScreen *deReportedScreen;
+@property(nonatomic) BOOL deProcessingHostResize;
+@property(nonatomic) BOOL deLiveResize;
 @property(nonatomic) NSInteger windowNumber;
 @property(nonatomic,strong) id<DEColorObject> backgroundColor;
 @property(nonatomic,weak) NSView *initialFirstResponder;
 @property(nonatomic,weak) NSView *firstResponder;
 @property(nonatomic,weak) id deMouseDownTarget;
 - (void)update;
+- (void)setFrame:(CGRect)frame display:(BOOL)display;
+- (void)updatePresentation;
 @end
 static NSHashTable<NSWindow *> *DEGameWindows;
 static __weak NSWindow *DEKeyGameWindow,*DEMainGameWindow;
@@ -621,6 +1051,54 @@ static void DEPostWindowTransition(NSWindow *window,NSString *name,SEL action) {
     id delegate=window.delegate;
     if(delegate && DEHasMouseHandler(object_getClass(delegate),action))((void(*)(id,SEL,id))objc_msgSend)(delegate,action,note);
     fprintf(stderr,"DE_WINDOW_TRANSITION %s window=%p\n",name.UTF8String,(__bridge void*)window);
+}
+static void DEGameHostDidLayout(DEGameViewHost *host) {
+    for(NSWindow *window in DEGameWindows.allObjects) {
+        if(!window.deVisible || window.contentView.deHost!=host || window.deProcessingHostResize)continue;
+        CGSize previous=window.deFrame.size;
+        CGRect frame=window.deFrame;frame.size=host.bounds.size;
+        if(window.styleMask & (1UL<<14)) {
+            frame.origin=CGPointZero;
+            frame.size=DEGameCanvasSize(window.deUIKitWindow.rootViewController.view.bounds.size);
+        }
+        BOOL resized=!CGSizeEqualToSize(previous,frame.size) || !CGSizeEqualToSize(host.bounds.size,frame.size);
+        window.deProcessingHostResize=YES;
+        if(resized) {
+            // Feral's window consumes the live-resize pair rather than
+            // windowDidResize:. Treat each committed UIKit layout as one
+            // complete resize, including folds and multitasking changes.
+            window.deLiveResize=YES;
+            DEPostWindowTransition(window,@"NSWindowWillStartLiveResizeNotification",sel_registerName("windowWillStartLiveResize:"));
+        }
+        // Publish the new values before callbacks; the engine can query them
+        // and lay out its child views while processing this notification.
+        // Dispatch through the original NSWindow subclass: Feral caches its
+        // pending render size in setFrame:display:. Updating only our adapter
+        // ivar leaves that cache at the pre-fold aspect ratio.
+        if(resized)[window setFrame:frame display:YES];
+        else window.deFrame=frame;
+        CGFloat oldScale=window.deReportedBackingScale,scale=DERenderScaleForView(host);
+        window.deReportedBackingScale=scale;
+        UIScreen *screen=window.deUIKitWindow.windowScene.screen ?: window.deUIKitWindow.screen;
+        BOOL changedScreen=window.deReportedScreen && window.deReportedScreen!=screen;
+        window.deReportedScreen=screen;
+        if(changedScreen)
+            DEPostWindowTransition(window,@"NSWindowDidChangeScreenNotification",sel_registerName("windowDidChangeScreen:"));
+        if(resized)
+            DEPostWindowTransition(window,@"NSWindowDidResizeNotification",sel_registerName("windowDidResize:"));
+        if(oldScale>0 && oldScale!=scale) {
+            NSNotification *note=[NSNotification notificationWithName:@"NSWindowDidChangeBackingPropertiesNotification" object:window
+                                                           userInfo:@{@"NSBackingPropertyOldScaleFactorKey":@(oldScale)}];
+            [NSNotificationCenter.defaultCenter postNotification:note];
+            id delegate=window.delegate;SEL action=sel_registerName("windowDidChangeBackingProperties:");
+            if(delegate && DEHasMouseHandler(object_getClass(delegate),action))((void(*)(id,SEL,id))objc_msgSend)(delegate,action,note);
+        }
+        if(resized) {
+            window.deLiveResize=NO;
+            DEPostWindowTransition(window,@"NSWindowDidEndLiveResizeNotification",sel_registerName("windowDidEndLiveResize:"));
+        }
+        window.deProcessingHostResize=NO;
+    }
 }
 void DEUpdateVisibleGameWindows(void) {
     for(NSWindow *window in DEGameWindows.allObjects) if(window.deVisible) [window update];
@@ -807,18 +1285,22 @@ void DEUpdateVisibleGameWindows(void) {
     [NSNotificationCenter.defaultCenter postNotificationName:@"NSWindowDidUpdateNotification" object:self];
 }
 - (CGPoint)convertPointFromScreen:(CGPoint)point {
-    UIView *root=self.contentView.deHost;UIScreen *screen=self.deUIKitWindow.screen;
-    CGPoint ui=CGPointMake(point.x,CGRectGetMaxY(screen.bounds)-point.y);
-    CGPoint local=[root convertPoint:ui fromCoordinateSpace:screen.coordinateSpace];
+    UIView *root=self.contentView.deHost;
+    CGRect viewport=DEHostBoundsForScreen(self.deUIKitWindow.windowScene.screen ?: self.deUIKitWindow.screen);
+    CGSize canvas=DEGameCanvasSize(viewport.size);
+    CGPoint ui=DEHostPointFromGame(CGPointMake(point.x,canvas.height-point.y),viewport.size);
+    CGPoint local=[root convertPoint:ui fromView:self.deUIKitWindow];
     CGPoint result=CGPointMake(local.x-root.bounds.origin.x,CGRectGetMaxY(root.bounds)-local.y);
     fprintf(stderr,"DE_INPUT_FROM_SCREEN in=%g,%g out=%g,%g root=%s\n",point.x,point.y,result.x,result.y,NSStringFromCGRect(root.frame).UTF8String);
     return result;
 }
 - (CGPoint)convertPointToScreen:(CGPoint)point {
-    UIView *root=self.contentView.deHost;UIScreen *screen=self.deUIKitWindow.screen;
+    UIView *root=self.contentView.deHost;
+    CGRect viewport=DEHostBoundsForScreen(self.deUIKitWindow.windowScene.screen ?: self.deUIKitWindow.screen);
     CGPoint local=CGPointMake(point.x+root.bounds.origin.x,CGRectGetMaxY(root.bounds)-point.y);
-    CGPoint ui=[root convertPoint:local toCoordinateSpace:screen.coordinateSpace];
-    CGPoint result=CGPointMake(ui.x,CGRectGetMaxY(screen.bounds)-ui.y);
+    CGPoint ui=[root convertPoint:local toView:self.deUIKitWindow];
+    CGPoint game=DEGamePointFromHost(ui,viewport.size);
+    CGPoint result=CGPointMake(game.x,DEGameCanvasSize(viewport.size).height-game.y);
     fprintf(stderr,"DE_INPUT_TO_SCREEN in=%g,%g out=%g,%g\n",point.x,point.y,result.x,result.y);
     return result;
 }
@@ -842,8 +1324,7 @@ void DEUpdateVisibleGameWindows(void) {
                                   CGRectGetMaxY(host.bounds)-event.locationInWindow.y);
         if(CGRectContainsPoint(host.bounds,local) && host.window) {
             CGPoint inWindow=[host convertPoint:local toView:host.window];
-            CGPoint global=[host.window convertPoint:inWindow toCoordinateSpace:host.window.screen.coordinateSpace];
-            DEUIKitSetPointerPosition(global);
+            DEUIKitSetPointerPosition(inWindow);
         }
     }
     for(NSString *name in @[@"cachedIsActive",@"cachedIsMain",@"cachedIsVisible"]) {
@@ -902,13 +1383,25 @@ void DEUpdateVisibleGameWindows(void) {
         _deFrame=rect;_styleMask=style;_title=@"";_windowNumber=DENextWindowNumber++;
         if(!DEGameWindows)DEGameWindows=[NSHashTable weakObjectsHashTable];
         [DEGameWindows addObject:self];
-        for (UIWindow *window in UIApplication.sharedApplication.windows) if (window.isKeyWindow) {_deUIKitWindow=window;break;}
+        _deUIKitWindow=DEHostWindow();
         if (!_deUIKitWindow) DEUnsupported("game window requires existing UIKit window");
         self.contentView=[[NSView alloc] initWithFrame:CGRectMake(0,0,rect.size.width,rect.size.height)];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(hostGeometryChanged:) name:@"DEUIKitDisplayGeometryDidChange" object:nil];
         fprintf(stderr,"DE_GAME_WINDOW_CREATED size=%gx%g style=%lu\n",rect.size.width,rect.size.height,(unsigned long)style);
     }return self;
 }
+- (void)hostGeometryChanged:(NSNotification *)note {
+    if(!self.deVisible)return;
+    UIScreen *screen=self.deUIKitWindow.windowScene.screen ?: self.deUIKitWindow.screen;
+    if(note.object && note.object!=screen)return;
+    if(self.styleMask & (1UL<<14))
+        self.contentView.deHost.frame=(CGRect){CGPointZero,DEGameCanvasSize(self.deUIKitWindow.rootViewController.view.bounds.size)};
+    [self updatePresentation];
+    [self.contentView.deHost setNeedsLayout];
+}
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
 - (void)setContentView:(NSView *)view {
+    [self.dePresentation removeFromSuperview];
     [_contentView.deHost removeFromSuperview];_contentView.deWindow=nil;_contentView=view;view.deWindow=self;
     if (self.deVisible) [self makeKeyAndOrderFront:nil];
 }
@@ -934,8 +1427,8 @@ void DEUpdateVisibleGameWindows(void) {
 }
 - (BOOL)canBecomeMainWindow { return YES; }
 - (CGRect)frame { return self.deFrame; }
-- (id)screen { return DEUIKitScreenObject(self.deUIKitWindow.screen); }
-- (CGFloat)backingScaleFactor { return DERenderScale(self.deUIKitWindow.screen); }
+- (id)screen { return DEUIKitScreenObject(self.deUIKitWindow.windowScene.screen ?: self.deUIKitWindow.screen); }
+- (CGFloat)backingScaleFactor { return DERenderScaleForWindow(self.deUIKitWindow); }
 - (CGRect)frameRectForContentRect:(CGRect)rect { return rect; } // UIKit host has no desktop decorations.
 - (CGRect)contentRectForFrameRect:(CGRect)rect { return rect; } // No desktop decorations.
 + (CGRect)contentRectForFrameRect:(CGRect)rect styleMask:(NSUInteger)style { return rect; }
@@ -966,12 +1459,29 @@ void DEUpdateVisibleGameWindows(void) {
     DEPostWindowTransition(self,@"NSWindowDidBecomeMainNotification",sel_registerName("windowDidBecomeMain:"));
 }
 - (BOOL)isMiniaturized { return NO; }
-- (BOOL)inLiveResize { return NO; } // This host exposes no interactive window-border resizing.
+- (BOOL)inLiveResize { return self.deLiveResize; }
 - (BOOL)isOnActiveSpace { return UIApplication.sharedApplication.applicationState!=UIApplicationStateBackground; }
+- (void)updatePresentation {
+    UIView *root=self.deUIKitWindow.rootViewController.view;
+    DEGameViewHost *host=self.contentView.deHost;
+    if(!root || !host)return;
+    if(!self.dePresentation)self.dePresentation=[UIView new];
+    BOOL fullscreen=(self.styleMask & (1UL<<14))!=0;
+    CGSize logical=fullscreen?DEGameCanvasSize(root.bounds.size):self.deFrame.size;
+    CGRect available=fullscreen?root.bounds:UIEdgeInsetsInsetRect(root.bounds,root.safeAreaInsets);
+    BOOL fitted=DEConfigureWindowPresentation(self.dePresentation,host,logical,available,fullscreen);
+    if(host.windowedPresentation!=fitted) {
+        [host cancelHostInput:nil];
+        host.windowedPresentation=fitted;
+        [host setNeedsLayout];
+    }
+    if(host.superview!=self.dePresentation)[self.dePresentation addSubview:host];
+    if(self.deVisible && self.dePresentation.superview!=root)[root addSubview:self.dePresentation];
+}
 - (void)center {
     CGRect bounds=self.deUIKitWindow.rootViewController.view.bounds;
     CGRect frame=self.deFrame;frame.origin=CGPointMake(CGRectGetMidX(bounds)-frame.size.width/2,CGRectGetMidY(bounds)-frame.size.height/2);self.deFrame=frame;
-    if (self.deVisible) self.contentView.deHost.frame=frame;
+    if (self.deVisible) [self updatePresentation];
 }
 - (void)makeKeyAndOrderFront:(id)sender {
     [self orderFront:sender];
@@ -982,8 +1492,9 @@ void DEUpdateVisibleGameWindows(void) {
     // Ordering another window front must not close/detach existing windows.
     // The original renderer may still submit to them until orderOut:/close.
     fprintf(stderr,"DE_WINDOW_ORDER_FRONT existing_hosts=%lu newhost=%p\n",(unsigned long)root.subviews.count,(__bridge void *)self.contentView.deHost);
-    self.contentView.deHost.frame=self.deFrame;
-    [root addSubview:self.contentView.deHost];[self.deUIKitWindow makeKeyAndVisible];self.deVisible=YES;
+    self.deVisible=YES;
+    [self updatePresentation];
+    [root bringSubviewToFront:self.dePresentation];[self.deUIKitWindow makeKeyAndVisible];
     if(getenv("AGEPAD_LAYER_ATTACH_FLUSH")){[root layoutIfNeeded];[CATransaction flush];fprintf(stderr,"DE_WINDOW_SHOW_FLUSH actual transaction submitted\n");}
     if (self.initialFirstResponder) [self makeFirstResponder:self.initialFirstResponder];
     fprintf(stderr,"DE_GAME_WINDOW_VISIBLE size=%gx%g\n",self.deFrame.size.width,self.deFrame.size.height);
@@ -1000,9 +1511,10 @@ void DEUpdateVisibleGameWindows(void) {
     [NSNotificationCenter.defaultCenter postNotification:note];
     if ([self.delegate respondsToSelector:willSelector]) ((void(*)(id,SEL,id))objc_msgSend)(self.delegate,willSelector,note);
     UIView *root=self.deUIKitWindow.rootViewController.view;
-    if (entering) { self.deWindowedFrame=self.deFrame;self.deFrame=root.bounds;self.styleMask|=(1UL<<14); }
+    if (entering) { self.deWindowedFrame=self.deFrame;self.deFrame=(CGRect){CGPointZero,DEGameCanvasSize(root.bounds.size)};self.styleMask|=(1UL<<14); }
     else { self.deFrame=self.deWindowedFrame;self.styleMask&=~(1UL<<14); }
-    self.contentView.frame=self.deFrame;
+    [self updatePresentation];
+    self.contentView.frame=(CGRect){CGPointZero,self.deFrame.size};
     self.contentView.deHost.autoresizingMask=entering?(UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight):UIViewAutoresizingNone;
     [root layoutIfNeeded];[self.contentView.deHost layoutIfNeeded];
     // UIKit owns the scene; full screen means filling its actual content area.
@@ -1018,9 +1530,16 @@ void DEUpdateVisibleGameWindows(void) {
         DELogHostGeometry(entering?@"fullscreen_enter":@"fullscreen_exit",self.contentView.deHost);
     });
 }
-- (void)setFrame:(CGRect)frame display:(BOOL)display { self.deFrame=frame;self.contentView.frame=CGRectMake(0,0,frame.size.width,frame.size.height); }
+- (void)setFrame:(CGRect)frame display:(BOOL)display {
+    // The engine may reapply its cached display mode from a resize callback.
+    // A UIKit full-screen window must still fill the current scene, including
+    // during the original engine's enter-full-screen notification sequence.
+    if(self.styleMask & (1UL<<14))frame=(CGRect){CGPointZero,DEGameCanvasSize(self.deUIKitWindow.rootViewController.view.bounds.size)};
+    self.deFrame=frame;self.contentView.frame=CGRectMake(0,0,frame.size.width,frame.size.height);
+    [self updatePresentation];
+}
 - (void)setContentSize:(CGSize)size { CGRect frame=self.deFrame;frame.size=size;[self setFrame:frame display:YES]; }
-- (void)orderOut:(id)sender { fprintf(stderr,"DE_WINDOW_DETACH window=%p host=%p layer=%p\n",(__bridge void *)self,(__bridge void *)self.contentView.deHost,(__bridge void *)self.contentView.layer); [self.contentView.deHost removeFromSuperview];self.deVisible=NO;[self resignKeyWindow];[self resignMainWindow]; }
+- (void)orderOut:(id)sender { fprintf(stderr,"DE_WINDOW_DETACH window=%p host=%p layer=%p\n",(__bridge void *)self,(__bridge void *)self.contentView.deHost,(__bridge void *)self.contentView.layer); [self.dePresentation removeFromSuperview];[self.contentView.deHost removeFromSuperview];self.deVisible=NO;[self resignKeyWindow];[self resignMainWindow]; }
 - (void)close { [self orderOut:nil]; }
 + (BOOL)resolveInstanceMethod:(SEL)sel {fprintf(stderr,"DE_UNSUPPORTED_SELECTOR -[NSWindow %s]\n",sel_getName(sel));DEUnsupported("NSWindow");}
 @end

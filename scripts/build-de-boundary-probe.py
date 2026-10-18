@@ -62,6 +62,7 @@ p.add_argument('artifacts',type=Path)
 p.add_argument('--application-bootstrap',action='store_true')
 p.add_argument('--constants',type=Path)
 p.add_argument('--main-executable',action='store_true')
+p.add_argument('--public-api',action='store_true',help='Compile out legacy private web hosting; require native startup and explicit legacy WebKit boundary')
 p.add_argument('--loader-trace',action='store_true',help='Diagnostic interposition; caller-relative loader semantics may differ')
 p.add_argument('--file-trace',action='store_true',help='Diagnostic real filesystem results for libsteam_api paths')
 p.add_argument('--steam-module-compat',action='store_true',help='Opt-in verified Steam module representation; requires staged manifest')
@@ -82,6 +83,8 @@ p.add_argument('--min-spec-dialog',action='store_true',help='Opt-in minimum-spec
 a=p.parse_args()
 if a.main_executable and not a.application_bootstrap:
     p.error('--main-executable requires --application-bootstrap')
+if a.public_api and not (a.application_bootstrap and a.main_executable and a.window_view_host):
+    p.error('--public-api requires --application-bootstrap, --main-executable and --window-view-host')
 if a.steam_module_compat and (not a.application_bootstrap or a.loader_trace):
     p.error('--steam-module-compat requires bootstrap and excludes --loader-trace')
 root=Path(__file__).resolve().parent.parent
@@ -93,6 +96,17 @@ art.mkdir(parents=True,exist_ok=True)
 incomplete=app/'BoundaryBuildIncomplete'
 incomplete.write_text('Boundary build has not completed. Do not execute this candidate.\n')
 survey=json.loads(a.survey.read_text())['platform_survey']
+LEGACY_WEB_CLASSES={'WebView':'DEPublicDesktopWebView',
+                    'WebScriptObject':'DEPublicDesktopWebScriptObject',
+                    'WebUndefined':'DEPublicDesktopWebUndefined'}
+if a.public_api:
+    webkit=[item for item in survey if item['path'].endswith('/WebKit.framework/WebKit')]
+    if len(webkit)!=1 or not webkit[0]['loaded']:
+        raise SystemExit('Public-API mode requires exactly one available public WebKit framework survey')
+    # The Simulator's WebKit exports some desktop legacy symbols privately.
+    # Bind these imports to our own classes instead of using those exports.
+    webkit[0]['missing_symbols']=sorted(set(webkit[0]['missing_symbols']) | {
+        '_OBJC_'+kind+'_$_'+cls for cls in LEGACY_WEB_CLASSES for kind in ('CLASS','METACLASS')})
 # CoreVideo itself loads on iOS, but the Mac display-link API is absent. The
 # loader probe only checks framework loading, so include these imports in the
 # boundary even when the framework reports as loaded.
@@ -112,6 +126,9 @@ adapter=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter)
 mapping={}
 manifest={'claim':'Diagnostic load only. Missing APIs abort. NULL data exports are not implementations.',
+          'runtime_policy':{'public_api':a.public_api,
+                            'scope':'legacy launcher replacement; full package API audit and runtime validation still required',
+                            'legacy_desktop_web_host':'excluded' if a.public_api else 'development'},
           'libraries':[],'images':[]}
 for item in survey:
     if item['loaded'] and not item['missing_symbols']:
@@ -121,7 +138,14 @@ for item in survey:
     install='@loader_path/DEBoundary_'+name+'.dylib'
     mapping[path]=install
     source=['#import <objc/runtime.h>','#include "UnsupportedBoundary.h"']
+    if a.public_api:
+        source.insert(0,'#define AGEPAD_PUBLIC_API 1')
     aliases=[]
+    if a.public_api and name=='WebKit':
+        source.append('#include "PublicLauncherCompat.m"')
+        for cls,actual in LEGACY_WEB_CLASSES.items():
+            for kind in ('CLASS','METACLASS'):
+                aliases.append('-Wl,-alias,_OBJC_'+kind+'_$_'+actual+',_OBJC_'+kind+'_$_'+cls)
     if a.metal_device_observer and name=='Metal':
         source.append('#include "MetalDevicesCompat.m"')
     if a.unavailable_gestalt and name=='CoreServices':
@@ -186,6 +210,9 @@ for item in survey:
     # the link. This mirrors build-de-simulator-runtime.py's stub stripping.
     implemented=implemented_symbols(included_sources(source))
     for i,symbol in enumerate(item['missing_symbols']):
+        if a.public_api and name=='WebKit' and symbol.startswith(('_OBJC_CLASS_$_','_OBJC_METACLASS_$_')) and symbol.split('$_',1)[1] in LEGACY_WEB_CLASSES:
+            actions.append({'symbol':symbol,'action':'AgePad desktop-launcher diagnostic class; no private iOS legacy WebKit binding'})
+            continue
         if symbol in implemented:
             actions.append({'symbol':symbol,'action':'implemented by an included port/de compat source'})
             continue
@@ -279,8 +306,10 @@ for item in survey:
              '-fobjc-arc','-dynamiclib','-I',str(root/'port/de'),str(src),'-framework','Foundation',
              '-Wl,-install_name,'+install,'-o',str(app/Path(install).name)]
     command.extend(aliases)
-    if a.application_bootstrap and name=='AppKit':
+    if a.public_api and name=='WebKit':
         command.extend(['-framework','UIKit'])
+    if a.application_bootstrap and name=='AppKit':
+        command.extend(['-framework','UIKit','-framework','UniformTypeIdentifiers'])
         if a.window_view_host:
             # WindowViewCompat.m hosts original layers and observes a GameController
             # keyboard, so both frameworks must be on the link line.
@@ -303,7 +332,8 @@ for item in survey:
         command.append('-Wl,-reexport_framework,AudioToolbox')
     run(*command)
     run('codesign','--force','--sign','-',app/Path(install).name)
-    manifest['libraries'].append({'path':path,'replacement':install,'reexports_original':bool(item['loaded']),'symbols':actions})
+    manifest['libraries'].append({'path':path,'replacement':install,'reexports_original':bool(item['loaded']),
+                                  'linker_aliases':aliases,'symbols':actions})
 
 input_app=a.input.resolve()
 vendors=[]

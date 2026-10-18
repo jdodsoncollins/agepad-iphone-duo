@@ -18,6 +18,7 @@ preamble=r'''
 #include "EventCompat.m"
 #include "EventQueueCompat.m"
 #include "PointerEventCompat.m"
+#include "HUDInputRegions.h"
 static CGPoint testPointer;
 CGPoint DEUIKitPointerPosition(void){return testPointer;}
 void DEUIKitSetPointerPosition(CGPoint p){testPointer=p;}
@@ -69,7 +70,9 @@ static BOOL DEInputVerbose(NSUInteger t){return NO;}
 @property(nonatomic) NSInteger gameClickCount;
 @property(nonatomic) CGPoint previousTouchPoint;
 @property(nonatomic) UIEventButtonMask gameButtonMask;
-@property(nonatomic) BOOL forceSecondary,overrideActive;
+@property(nonatomic) BOOL forceSecondary,overrideActive,pendingClickDelivery;
+@property(nonatomic,strong) id pendingClickContext;
+@property(nonatomic,strong) NSMutableArray *pendingClicks;
 @property(nonatomic) CGPoint overridePoint;
 -(void)sendGameMouse:(NSUInteger)type touch:(UITouch *)touch cancelled:(BOOL)cancelled;
 @end
@@ -116,13 +119,11 @@ sdk=subprocess.check_output(['xcrun','--sdk','iphonesimulator','--show-sdk-path'
 subprocess.run(['xcrun','clang','-fobjc-arc','-target','arm64-apple-ios17.0-simulator','-isysroot',sdk,'-I',str(root/'port/de'),str(out/'InputProbe.m'),'-framework','Foundation','-framework','UIKit','-framework','QuartzCore','-framework','GameController','-framework','CoreGraphics','-o',str(out/'InputProbe')],check=True)
 subprocess.run(['codesign','-s','-','--force',str(out/'InputProbe')],check=True)
 
-# Exercise the real adapter in the AgePad Simulator when it is booted (other
-# tasks' Simulators may run alongside; they are not touched).
+# Runtime probes obey the same one-booted-device rule as game sessions.
 device=de_device.device_udid()
-boot=json.loads(subprocess.check_output(['xcrun','simctl','list','devices','booted','-j'],text=True))
-booted=[d['udid'] for group in boot['devices'].values() for d in group]
-if device not in booted:
-    print('COMPILED; run skipped: boot the AgePad Simulator (%s) to run it.' % device)
+allowed,reason=de_device.require_sole_device(device)
+if not allowed:
+    print('COMPILED; runtime skipped: ' + reason)
     sys.exit(0)
 run=subprocess.run(['xcrun','simctl','spawn',device,str(out/'InputProbe')],capture_output=True,text=True,timeout=30)
 (out/'run.stderr').write_text(run.stderr)

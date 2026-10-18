@@ -4,19 +4,20 @@
 int main(void) {
     @autoreleasepool {
         UIScreen *screen=UIScreen.mainScreen;
+        CGSize canvas=DEGameBoundsForScreen(screen).size;
         const void *mode=CGDisplayCopyDisplayMode(DEUIKitDisplayIdentifier(screen));
-        BOOL dimensions=mode && CGDisplayModeGetWidth(mode)==(size_t)screen.bounds.size.width
-            && CGDisplayModeGetHeight(mode)==(size_t)screen.bounds.size.height;
+        BOOL dimensions=mode && CGDisplayModeGetWidth(mode)==(size_t)canvas.width
+            && CGDisplayModeGetHeight(mode)==(size_t)canvas.height;
         BOOL absent=CGDisplayCopyDisplayMode(UINT32_MAX)==NULL && CGDisplayModeGetWidth(NULL)==0 && CGDisplayModeGetHeight(NULL)==0;
         if (mode) CFRetain(mode);
         CGDisplayModeRelease(mode);
-        BOOL retained=mode && CGDisplayModeGetWidth(mode)==(size_t)screen.bounds.size.width;
+        BOOL retained=mode && CGDisplayModeGetWidth(mode)==(size_t)canvas.width;
         CGDisplayModeRelease(mode);CGDisplayModeRelease(NULL);
         CFArrayRef modes=CGDisplayCopyAllDisplayModes(DEUIKitDisplayIdentifier(screen),NULL);
         BOOL enumerated=modes && CFArrayGetCount(modes)==1;
         if (enumerated) {
             const void *entry=CFArrayGetValueAtIndex(modes,0);
-            enumerated=CGDisplayModeGetWidth(entry)==(size_t)screen.bounds.size.width && CGDisplayModeGetIOFlags(entry)==3;
+            enumerated=CGDisplayModeGetWidth(entry)==(size_t)canvas.width && CGDisplayModeGetIOFlags(entry)==3;
         }
         if (modes) CFRelease(modes);
         printf("{\"current_mode_enumeration_and_flags\":%s}\n",enumerated?"true":"false");

@@ -148,6 +148,8 @@ def main():
     parser.add_argument('--client-survey', type=Path,
                         help='Reuse an existing Steam client survey JSON (same Steam and iOS versions) '
                              'instead of running LibrarySymbolSurvey in the Simulator')
+    parser.add_argument('--public-api', action='store_true',
+                        help='Compile out the development legacy web launcher and use public native startup')
     parser.add_argument('--only', action='append', default=[],
                         help='Run only these stages (repeatable); later stages still need their inputs')
     parser.add_argument('--skip', action='append', default=[], help='Skip these stages (repeatable)')
@@ -174,7 +176,8 @@ def main():
     package.mkdir(exist_ok=True)
     survey = args.survey.resolve() if args.survey else art / 'platform-survey.json'
     shader = art / 'shader/feral.metallib'
-    record = {'game': str(game), 'device': device, 'stages': {}, 'boundary_flags': BOUNDARY_FLAGS}
+    boundary_flags = BOUNDARY_FLAGS + (['--public-api'] if args.public_api else [])
+    record = {'game': str(game), 'device': device, 'stages': {}, 'boundary_flags': boundary_flags}
 
     def done(stage, **extra):
         record.setdefault('stages', {})[stage] = dict(
@@ -269,7 +272,7 @@ def main():
     def boundary(target, constants):
         command = [sys.executable, ROOT / 'scripts/build-de-boundary-probe.py',
                    game / 'Age Of Empires II.app', target, survey,
-                   art / (target.name + '-art')] + BOUNDARY_FLAGS
+                   art / (target.name + '-art')] + boundary_flags
         if constants:
             command += ['--constants', constants]
         run(command, log=log)

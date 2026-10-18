@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the generated DE boundary sources against the iPad device SDK.
+"""Check the generated DE boundary sources against the iOS device SDK.
 
 Legacy packages recorded link commands; fresh bootstrap packages contain the
 generated sources instead. For a fresh package this checks every source and
@@ -29,6 +29,19 @@ def client_dir(package):
     return CLIENT_DIR or package / 'game-client'
 
 
+def runtime_policy(package):
+    art=package.parent / 'artifacts/candidate.app-art'
+    manifest=json.loads((art / 'boundary-manifest.json').read_text())
+    policy=manifest.get('runtime_policy', {'public_api': False})
+    if policy.get('public_api'):
+        for name in ('AppKit.m','WebKit.m'):
+            if not (art / name).read_text().startswith('#define AGEPAD_PUBLIC_API 1\n'):
+                raise SystemExit('Public API marker missing from generated boundary source: ' + name)
+        if not any(Path(item['replacement']).name=='DEBoundary_WebKit.dylib' for item in manifest['libraries']):
+            raise SystemExit('Public API package is missing the legacy WebKit replacement boundary')
+    return policy
+
+
 def check_fresh_sources(package, output, sdk):
     roots = [package.parent / 'artifacts/candidate.app-art', client_dir(package)]
     sources = [source for root in roots for source in sorted(root.glob('*.m'))]
@@ -46,7 +59,7 @@ def check_fresh_sources(package, output, sdk):
                         'errors': [line.strip() for line in run.stderr.splitlines()
                                    if re.search(r':\d+:\d+: error:', line)][:20]}
     report = {'scope': 'device-SDK syntax only; no link, signing, game install, Steam session, or gameplay',
-              'sdk': sdk, 'sources': results}
+              'runtime_policy': runtime_policy(package), 'sdk': sdk, 'sources': results}
     (output / 'device-compile-result.json').write_text(json.dumps(report, indent=2) + '\n')
     failed = [key for key, value in results.items() if value['exit']]
     print(f'Device SDK source check: {len(sources)} generated sources, {len(failed)} failures')
@@ -71,7 +84,7 @@ def link_fresh_boundaries(package, output, sdk):
                    '-o', str(destination)]
         if name == 'DEBoundary_AppKit.dylib':
             command += ['-framework', 'UIKit', '-framework', 'QuartzCore', '-framework',
-                        'GameController', '-framework', 'Metal', '-framework', 'CoreGraphics',
+                        'GameController', '-framework', 'Metal', '-framework', 'CoreGraphics', '-framework', 'UniformTypeIdentifiers',
                         '-framework', 'AudioToolbox', '-framework', 'AVFoundation']
             command.append(str(ROOT / 'port/de/DeviceAudioOutput.m'))
             command += [str(ROOT / 'port/de/DeviceLocaleCompat.mm'), '-lc++']
@@ -82,6 +95,10 @@ def link_fresh_boundaries(package, output, sdk):
                         str(ROOT / 'port/steam-engine/SteamEngineHost.c'),
                         str(ROOT / 'port/steam-engine/SteamQRSignIn.m'),
                         str(ROOT / 'port/steam-engine/AgePadSteamRoute.m'),
+                        str(ROOT / 'port/steam-engine/SteamContentClient.m'),
+                        str(ROOT / 'port/de/SteamAssetDownload.m'),
+                        str(ROOT / 'port/third_party/zstd/zstddeclib.c'),
+                        '-I', str(ROOT / 'port/third_party/xz/include'), '-llzma', '-lz',
                         '-framework', 'CoreImage', '-framework', 'ImageIO', '-framework', 'Security',
                         '-framework', 'Network']
             # The generated NSColor diagnostic class has a different ObjC name
@@ -96,6 +113,15 @@ def link_fresh_boundaries(package, output, sdk):
             command += ['-framework', 'UIKit', '-framework', 'QuartzCore']
         if name == 'DEBoundary_Metal.dylib':
             command += ['-framework', 'Metal', '-framework', 'UIKit']
+        if name == 'DEBoundary_WebKit.dylib' and manifest.get('runtime_policy', {}).get('public_api'):
+            command += ['-framework', 'UIKit']
+            aliases=item.get('linker_aliases', [])
+            expected={f'-Wl,-alias,_OBJC_{kind}_$_DEPublicDesktop{actual},_OBJC_{kind}_$_{original}'
+                      for original, actual in [('WebView','WebView'), ('WebScriptObject','WebScriptObject'), ('WebUndefined','WebUndefined')]
+                      for kind in ('CLASS','METACLASS')}
+            if set(aliases)!=expected or len(aliases)!=len(expected):
+                raise SystemExit('Public WebKit boundary requires its exact legacy class aliases')
+            command += aliases
         if item['reexports_original']:
             original = item['path']
             framework = re.search(r'/([^/]+)\.framework/', original)
@@ -117,7 +143,7 @@ def link_fresh_boundaries(package, output, sdk):
                          'errors': [line.strip() for line in run.stderr.splitlines()
                                     if re.search(r':\d+:\d+: error:|^ld: error:|^Undefined symbols', line)][:20]}
     report = {'scope': 'device SDK boundary links only; no game binary, signing, Steam session, or gameplay',
-              'sdk': sdk, 'libraries': results}
+              'runtime_policy': runtime_policy(package), 'sdk': sdk, 'libraries': results}
     (output / 'device-link-result.json').write_text(json.dumps(report, indent=2) + '\n')
     failed = [key for key, value in results.items() if value['exit'] or value['platform'] != 'IOS']
     print(f'Device SDK boundary link: {len(results)} libraries, {len(failed)} failures')
@@ -165,6 +191,7 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--package', type=Path, default=de_device.package_dir())
     parser.add_argument('--steam-client', type=Path, help='Steam client chain folder (default: PACKAGE/game-client)')
+    parser.add_argument('--public-api', action='store_true', help='Require explicitly generated public-API boundary sources')
     args = parser.parse_args()
     global CLIENT_DIR
     CLIENT_DIR = args.steam_client.resolve(strict=True) if args.steam_client else None
@@ -176,12 +203,17 @@ def main():
     output.mkdir(parents=True)
     sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
     if missing:
+        policy=runtime_policy(args.package.resolve())
+        if args.public_api and not policy.get('public_api'):
+            parser.error('--public-api requires a candidate generated with the public-API boundary mode')
         if check_fresh_sources(args.package.resolve(), output, sdk):
             raise SystemExit(1)
         if link_fresh_boundaries(args.package.resolve(), output, sdk):
             raise SystemExit(1)
         link_client_replacements(args.package.resolve(), output, sdk)
         return
+    if args.public_api:
+        parser.error('--public-api requires fresh generated sources, not legacy recorded build commands')
     results = {}
     for name, library in [('appkit', 'AppKit'), ('display', 'CoreGraphics'), ('metal', 'Metal')]:
         command = json.loads((args.package / (name + '-build-command.json')).read_text())
