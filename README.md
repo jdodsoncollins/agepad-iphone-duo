@@ -16,6 +16,13 @@ assets. Personal app builds contain files from your own game and Steam
 installation and must stay private. There is no downloadable game or ready-made
 IPA in this fork, and no TestFlight release.
 
+## Screenshots
+
+<img src="docs/images/steam-library-iphone-17-pro-max.png" width="900" alt="AgePad's Steam library in a landscape iPhone 17 Pro Max frame, showing Age of Empires II: Definitive Edition installed, a Play button, and the option to import game files from Files.">
+
+Steam library after sign-in, with the core game ready to play. User-provided
+phone capture in a landscape iPhone 17 Pro Max frame; no gameplay is shown.
+
 ## Differences from upstream
 
 The comparison below is against upstream commit
